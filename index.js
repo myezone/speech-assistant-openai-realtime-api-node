@@ -8,7 +8,12 @@ import fastifyWs from '@fastify/websocket';
 dotenv.config();
 
 // Retrieve the OpenAI API key from environment variables.
-const { OPENAI_API_KEY } = process.env;
+const { OPENAI_API_KEY, VECTOR_STORE_ID } = process.env;
+
+if (!VECTOR_STORE_ID) {
+  console.error('Missing VECTOR_STORE_ID. Please set it in Render Environment variables.');
+  process.exit(1);
+}
 
 if (!OPENAI_API_KEY) {
     console.error('Missing OpenAI API key. Please set it in the .env file.');
@@ -21,7 +26,12 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // Constants
-const SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts. You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. Always stay positive, but work in a joke when appropriate.';
+const SYSTEM_MESSAGE =
+  "You are a phone support agent for CallsAnswered.ai. " +
+  "You MUST answer using ONLY the information returned by the kb_search tool. " +
+  "Before answering any user question, call kb_search with a short query. " +
+  "If the tool returns no relevant information, say: 'I don’t have that information in the knowledge base.' " +
+  "Do not use outside knowledge. Do not guess.";
 const VOICE = 'alloy';
 const TEMPERATURE = 0.8; // Controls the randomness of the AI's responses
 const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
@@ -62,6 +72,58 @@ fastify.all('/incoming-call', async (request, reply) => {
 
     reply.type('text/xml').send(twimlResponse);
 });
+async function searchKb(query) {
+  const resp = await fetch(`https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/search`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+      // Some vector store endpoints use this header:
+      "OpenAI-Beta": "assistants=v2",
+    },
+    body: JSON.stringify({
+      query,
+      max_num_results: 5,
+      ranking_options: { rewrite_query: true }
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`KB search failed: ${resp.status} ${errText}`);
+  }
+  return resp.json();
+}
+if (msg.type === "response.done") {
+  const out = msg.response?.output?.[0];
+
+  if (out?.type === "function_call" && out?.name === "kb_search") {
+    const callId = out.call_id;
+    const args = JSON.parse(out.arguments || "{}");
+    const query = args.query || "";
+
+    let kb;
+    try {
+      kb = await searchKb(query);
+    } catch (e) {
+      kb = { error: String(e) };
+    }
+
+    // Send tool output back
+    openaiWs.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "function_call_output",
+        call_id: callId,
+        output: JSON.stringify(kb)
+      }
+    }));
+
+    // Ask model to respond now that it has KB results
+    openaiWs.send(JSON.stringify({ type: "response.create" }));
+  }
+}
+
 
 // WebSocket route for media-stream
 fastify.register(async (fastify) => {
