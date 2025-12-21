@@ -82,6 +82,8 @@ async function searchKb(query) {
     const errText = await resp.text();
     throw new Error(`KB search failed: ${resp.status} ${errText}`);
   }
+  console.log("KB search query:", query);
+  console.log("KB search status:", resp.status);
   return resp.json();
 }
 
