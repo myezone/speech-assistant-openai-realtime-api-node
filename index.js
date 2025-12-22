@@ -28,7 +28,7 @@ const SYSTEM_MESSAGE =
   "If the tool returns no relevant information, say: 'I don’t have that information in the knowledge base.' " +
   "Do not use outside knowledge. Do not guess.";
 
-const VOICE = 'Marin';
+const VOICE = 'marin';
 const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
 
