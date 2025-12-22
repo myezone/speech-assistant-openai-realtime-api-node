@@ -17,7 +17,7 @@ if (!VECTOR_STORE_ID) {
   process.exit(1);
 }
 
-const fastify = Fastify();
+const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
@@ -50,18 +50,37 @@ fastify.get('/', async (request, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
+// Optional: Verify vector store is populated (helps debug "no KB results")
+fastify.get('/kb-status', async (request, reply) => {
+  try {
+    const resp = await fetch(`https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/files`, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'assistants=v2'
+      }
+    });
+    const json = await resp.json();
+    reply.code(resp.status).send(json);
+  } catch (e) {
+    reply.code(500).send({ error: String(e) });
+  }
+});
+
 fastify.all('/incoming-call', async (request, reply) => {
+  const host = request.headers['x-forwarded-host'] || request.headers.host;
+  fastify.log.info({ host }, 'Twilio incoming-call host');
+
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Google.en-US-Chirp3-HD-Aoede">Thank you for calling CallsAnswered dot AI</Say>
   <Pause length="1"/>
   <Say voice="Google.en-US-Chirp3-HD-Aoede">How can I help you?</Say>
   <Connect>
-    <Stream url="wss://${request.headers.host}/media-stream" />
+    <Stream url="wss://${host}/media-stream" />
   </Connect>
 </Response>`;
 
-  reply.type('text/xml').send(twimlResponse);
+  reply.code(200).type('text/xml').send(twimlResponse);
 });
 
 async function searchKb(query) {
@@ -84,14 +103,13 @@ async function searchKb(query) {
     throw new Error(`KB search failed: ${resp.status} ${errText}`);
   }
 
-  console.log('KB search query:', query);
-  console.log('KB search status:', resp.status);
+  fastify.log.info({ query }, 'KB search query');
   return resp.json();
 }
 
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-    console.log('Client connected');
+    fastify.log.info('Client connected (Twilio WS)');
 
     let streamSid = null;
     let latestMediaTimestamp = 0;
@@ -100,10 +118,10 @@ fastify.register(async (fastify) => {
     let responseStartTimestampTwilio = null;
 
     // ---- Realtime response concurrency control ----
-    let responseInFlight = false;         // true when a Realtime "response" is active
-    let queuedResponseCreate = false;     // request a new response as soon as the current one finishes
-    let activeResponseId = null;          // best-effort tracking for logs/debug
-    const handledToolCalls = new Set();   // dedupe kb_search tool calls by call_id
+    let responseInFlight = false;
+    let queuedResponseCreate = false;
+    let activeResponseId = null;
+    const handledToolCalls = new Set();
 
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`,
@@ -117,65 +135,60 @@ fastify.register(async (fastify) => {
     };
 
     const requestResponseCreate = (reason = '') => {
-      // If a response is already in progress, queue the request.
       if (responseInFlight) {
         queuedResponseCreate = true;
         return;
       }
       responseInFlight = true;
       safeSendOpenAI({ type: 'response.create' });
-      if (reason) console.log('Sent response.create', { reason });
+      if (reason) fastify.log.info({ reason }, 'Sent response.create');
     };
 
-const initializeSession = () => {
-  const sessionUpdate = {
-    type: 'session.update',
-    session: {
-      type: 'realtime',
-      model: 'gpt-realtime',
+    const initializeSession = () => {
+      const sessionUpdate = {
+        type: 'session.update',
+        session: {
+          type: 'realtime',
+          model: 'gpt-realtime',
 
-      // TEMP: allow text so we can see what's happening in logs
-      output_modalities: ['audio', 'text'],
+          // Keep text enabled until debugging is done.
+          // Once stable, you can change back to ['audio'].
+          output_modalities: ['audio', 'text'],
 
-      // 🔥 THIS IS THE MOST IMPORTANT LINE
-      input_audio_transcription: {
-        model: 'whisper-1'
-      },
+          // KEY: turn on transcription so the model has semantic input
+          input_audio_transcription: { model: 'whisper-1' },
 
-      audio: {
-        input: {
-          format: { type: 'audio/pcmu' },
-          turn_detection: { type: 'server_vad' }
-        },
-        output: {
-          format: { type: 'audio/pcmu' },
-          voice: VOICE
-        }
-      },
-
-      instructions: SYSTEM_MESSAGE,
-
-      tools: [
-        {
-          type: 'function',
-          name: 'kb_search',
-          description: 'Search the CallsAnswered.ai knowledge base and return relevant passages.',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: { type: 'string' }
+          audio: {
+            input: {
+              format: { type: 'audio/pcmu' },
+              turn_detection: { type: 'server_vad' }
             },
-            required: ['query']
-          }
+            output: {
+              format: { type: 'audio/pcmu' },
+              voice: VOICE
+            }
+          },
+
+          instructions: SYSTEM_MESSAGE,
+
+          tools: [
+            {
+              type: 'function',
+              name: 'kb_search',
+              description: 'Search the CallsAnswered.ai knowledge base and return relevant passages.',
+              parameters: {
+                type: 'object',
+                properties: { query: { type: 'string' } },
+                required: ['query']
+              }
+            }
+          ],
+          tool_choice: 'auto'
         }
-      ],
+      };
 
-      tool_choice: 'auto'
-    }
-  };
-
-  safeSendOpenAI(sessionUpdate);
-};
+      safeSendOpenAI(sessionUpdate);
+    };
 
     const sendMark = () => {
       if (!streamSid) return;
@@ -197,7 +210,6 @@ const initializeSession = () => {
           });
         }
 
-        // Cancel any active model response so we don't attempt to create a new one while it's still active.
         if (responseInFlight) {
           safeSendOpenAI({ type: 'response.cancel' });
           responseInFlight = false;
@@ -214,7 +226,7 @@ const initializeSession = () => {
     };
 
     openAiWs.on('open', () => {
-      console.log('Connected to the OpenAI Realtime API');
+      fastify.log.info('Connected to the OpenAI Realtime API');
       setTimeout(initializeSession, 100);
     });
 
@@ -223,15 +235,19 @@ const initializeSession = () => {
         const response = JSON.parse(data);
 
         if (LOG_EVENT_TYPES.includes(response.type)) {
-          console.log(`Received event: ${response.type}`, response);
+          fastify.log.info({ type: response.type, response_id: response.response_id }, 'OpenAI event');
         }
 
-        // Track whether a response is in progress (important when server auto-creates responses from VAD).
+        // Helpful: print transcription events so you can verify what caller said
+        if (response.type === 'conversation.item.input_audio_transcription.completed') {
+          fastify.log.info({ transcription_event: response }, 'TRANSCRIPTION COMPLETED (raw)');
+        }
+
+        // Track whether a response is in progress
         if (response.type === 'response.created') {
           responseInFlight = true;
           activeResponseId = response.response?.id ?? response.response_id ?? null;
         } else if (response.type === 'response.done') {
-          // Mark current response finished and send any queued response.create.
           responseInFlight = false;
           activeResponseId = null;
 
@@ -239,8 +255,7 @@ const initializeSession = () => {
             queuedResponseCreate = false;
             requestResponseCreate('queued_after_response_done');
           }
-        } else if (response.response_id && response.type.startsWith('response.')) {
-          // Most response.* events include response_id. Seeing one means a response is active.
+        } else if (response.response_id && response.type?.startsWith?.('response.')) {
           responseInFlight = true;
           activeResponseId = response.response_id;
         }
@@ -265,7 +280,6 @@ const initializeSession = () => {
           if (functionCall.name === 'kb_search' && functionCall.call_id) {
             const callId = functionCall.call_id;
 
-            // Dedupe tool calls
             if (handledToolCalls.has(callId)) return;
             handledToolCalls.add(callId);
 
@@ -278,20 +292,30 @@ const initializeSession = () => {
             }
 
             const query = (args?.query || '').toString().trim();
+            fastify.log.info({ query, callId }, 'kb_search tool call');
 
             let kbJson;
             try {
               kbJson = await searchKb(query);
-              console.log("KB raw response:", JSON.stringify(kbJson, null, 2));
+              fastify.log.info({ kbJson }, 'KB raw response');
             } catch (e) {
               kbJson = { error: String(e) };
+              fastify.log.error({ err: String(e) }, 'KB search error');
             }
 
             const results = kbJson?.data || kbJson?.results || kbJson?.matches || [];
+
+            // More robust extraction (different shapes exist depending on the API response)
             const passages = Array.isArray(results)
               ? results
                   .slice(0, 5)
-                  .map((r) => r?.content?.[0]?.text || r?.text || r?.document?.text || r?.document || '')
+                  .map((r) =>
+                    r?.content?.[0]?.text?.value ??
+                    r?.content?.[0]?.text ??
+                    r?.text ??
+                    r?.document?.text ??
+                    (typeof r?.document === 'string' ? r.document : '')
+                  )
                   .filter(Boolean)
                   .join('\n---\n')
               : '';
@@ -305,13 +329,12 @@ const initializeSession = () => {
               }
             });
 
-            // Important: do NOT send response.create if a response is still active.
-            // Queue it if needed, and it will send after response.done.
+            // Queue response.create if one is already active
             requestResponseCreate('after_kb_search_output');
           }
         }
       } catch (err) {
-        console.error('Error processing OpenAI message:', err);
+        fastify.log.error({ err: String(err) }, 'Error processing OpenAI message');
       }
     });
 
@@ -322,9 +345,8 @@ const initializeSession = () => {
         switch (data.event) {
           case 'start':
             streamSid = data.start.streamSid;
-            console.log('Incoming stream started', streamSid);
+            fastify.log.info({ streamSid }, 'Incoming stream started');
 
-            // Reset all per-call state
             latestMediaTimestamp = 0;
             responseStartTimestampTwilio = null;
             lastAssistantItem = null;
@@ -344,11 +366,11 @@ const initializeSession = () => {
             break;
 
           case 'connected':
-            console.log('Received non-media event: connected');
+            fastify.log.info('Received non-media event: connected');
             break;
 
           case 'stop':
-            console.log('Received stop event from Twilio.');
+            fastify.log.info('Received stop event from Twilio.');
             break;
 
           case 'mark':
@@ -356,33 +378,36 @@ const initializeSession = () => {
             break;
 
           default:
-            console.log('Received non-media event:', data.event);
+            fastify.log.info({ event: data.event }, 'Received non-media event');
         }
       } catch (err) {
-        console.error('Error parsing Twilio message:', err);
+        fastify.log.error({ err: String(err) }, 'Error parsing Twilio message');
       }
     });
 
+    // IMPORTANT: avoid "WebSocket was closed before the connection was established"
     connection.on('close', () => {
-      console.log('Client disconnected.');
+      fastify.log.info('Client disconnected (Twilio WS).');
       try {
-        openAiWs.close();
-      } catch {}
+        if (openAiWs.readyState === WebSocket.OPEN) {
+          openAiWs.close(1000, 'twilio_disconnected');
+        } else if (openAiWs.readyState === WebSocket.CONNECTING) {
+          openAiWs.terminate();
+        }
+      } catch (e) {
+        fastify.log.error({ err: String(e) }, 'Error closing OpenAI WS');
+      }
     });
 
-    openAiWs.on('close', () => console.log('Disconnected from OpenAI Realtime API'));
-    openAiWs.on('error', (e) => console.error('OpenAI WS error:', e));
-    if (response.type === 'conversation.item.input_audio_transcription.completed') {
-  console.log('Caller said:', response.transcript);
-}
-
+    openAiWs.on('close', () => fastify.log.info('Disconnected from OpenAI Realtime API'));
+    openAiWs.on('error', (e) => fastify.log.error({ err: String(e) }, 'OpenAI WS error'));
   });
 });
 
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
   if (err) {
-    console.error(err);
+    fastify.log.error(err);
     process.exit(1);
   }
-  console.log(`Server is listening on port ${PORT}`);
+  fastify.log.info(`Server is listening on port ${PORT}`);
 });
