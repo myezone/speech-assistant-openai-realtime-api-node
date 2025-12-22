@@ -127,35 +127,55 @@ fastify.register(async (fastify) => {
       if (reason) console.log('Sent response.create', { reason });
     };
 
-    const initializeSession = () => {
-      const sessionUpdate = {
-        type: 'session.update',
-        session: {
-          type: 'realtime',
-          model: 'gpt-realtime',
-          output_modalities: ['audio'],
-          audio: {
-            input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad' } },
-            output: { format: { type: 'audio/pcmu' }, voice: VOICE }
-          },
-          instructions: SYSTEM_MESSAGE,
-          tools: [
-            {
-              type: 'function',
-              name: 'kb_search',
-              description: 'Search the CallsAnswered.ai knowledge base and return relevant passages.',
-              parameters: {
-                type: 'object',
-                properties: { query: { type: 'string' } },
-                required: ['query']
-              }
-            }
-          ],
-          tool_choice: 'auto'
+const initializeSession = () => {
+  const sessionUpdate = {
+    type: 'session.update',
+    session: {
+      type: 'realtime',
+      model: 'gpt-realtime',
+
+      // TEMP: allow text so we can see what's happening in logs
+      output_modalities: ['audio', 'text'],
+
+      // 🔥 THIS IS THE MOST IMPORTANT LINE
+      input_audio_transcription: {
+        model: 'whisper-1'
+      },
+
+      audio: {
+        input: {
+          format: { type: 'audio/pcmu' },
+          turn_detection: { type: 'server_vad' }
+        },
+        output: {
+          format: { type: 'audio/pcmu' },
+          voice: VOICE
         }
-      };
-      safeSendOpenAI(sessionUpdate);
-    };
+      },
+
+      instructions: SYSTEM_MESSAGE,
+
+      tools: [
+        {
+          type: 'function',
+          name: 'kb_search',
+          description: 'Search the CallsAnswered.ai knowledge base and return relevant passages.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string' }
+            },
+            required: ['query']
+          }
+        }
+      ],
+
+      tool_choice: 'auto'
+    }
+  };
+
+  safeSendOpenAI(sessionUpdate);
+};
 
     const sendMark = () => {
       if (!streamSid) return;
@@ -352,6 +372,10 @@ fastify.register(async (fastify) => {
 
     openAiWs.on('close', () => console.log('Disconnected from OpenAI Realtime API'));
     openAiWs.on('error', (e) => console.error('OpenAI WS error:', e));
+    if (response.type === 'conversation.item.input_audio_transcription.completed') {
+  console.log('Caller said:', response.transcript);
+}
+
   });
 });
 
