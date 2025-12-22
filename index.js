@@ -28,7 +28,7 @@ const SYSTEM_MESSAGE =
   "If the tool returns no relevant information, say: 'I don’t have that information in the knowledge base.' " +
   "Do not use outside knowledge. Do not guess.";
 
-const VOICE = 'alloy';
+const VOICE = 'Marin';
 const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
 
@@ -53,9 +53,9 @@ fastify.get('/', async (request, reply) => {
 fastify.all('/incoming-call', async (request, reply) => {
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while we connect you to our voice assistant, powered by Twilio and the OpenAI Realtime API.</Say>
+  <Say voice="Google.en-US-Chirp3-HD-Aoede">Thank you for calling CallsAnswered dot AI</Say>
   <Pause length="1"/>
-  <Say voice="Google.en-US-Chirp3-HD-Aoede">OK — you can start talking.</Say>
+  <Say voice="Google.en-US-Chirp3-HD-Aoede">How can I help you?</Say>
   <Connect>
     <Stream url="wss://${request.headers.host}/media-stream" />
   </Connect>
@@ -262,6 +262,7 @@ fastify.register(async (fastify) => {
             let kbJson;
             try {
               kbJson = await searchKb(query);
+              console.log("KB raw response:", JSON.stringify(kbJson, null, 2));
             } catch (e) {
               kbJson = { error: String(e) };
             }
