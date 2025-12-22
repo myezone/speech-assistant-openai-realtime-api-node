@@ -6,7 +6,7 @@ import fastifyWs from '@fastify/websocket';
 
 dotenv.config();
 
-const { OPENAI_API_KEY, VECTOR_STORE_ID } = process.env;
+const { OPENAI_API_KEY, VECTOR_STORE_ID, ENABLE_TRANSCRIPTION } = process.env;
 
 if (!OPENAI_API_KEY) {
   console.error('Missing OPENAI_API_KEY in environment variables.');
@@ -28,29 +28,28 @@ const SYSTEM_MESSAGE =
   "If the tool returns no relevant information, say: 'I don’t have that information in the knowledge base.' " +
   "Do not use outside knowledge. Do not guess.";
 
-const VOICE = 'marin';
+const VOICE = 'marin'; // valid per OpenAI docs
 const TEMPERATURE = 0.8;
 const PORT = process.env.PORT || 5050;
 
 const LOG_EVENT_TYPES = [
   'error',
-  'response.created',
-  'response.content.done',
-  'rate_limits.updated',
-  'response.done',
-  'response.output_item.done',
-  'input_audio_buffer.committed',
-  'input_audio_buffer.speech_stopped',
-  'input_audio_buffer.speech_started',
   'session.created',
-  'session.updated'
+  'session.updated',
+  'input_audio_buffer.committed',
+  'input_audio_buffer.speech_started',
+  'input_audio_buffer.speech_stopped',
+  'response.created',
+  'response.output_item.done',
+  'response.done',
+  'rate_limits.updated'
 ];
 
 fastify.get('/', async (request, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// Optional: Verify vector store is populated (helps debug "no KB results")
+// Optional: verify vector store has files
 fastify.get('/kb-status', async (request, reply) => {
   try {
     const resp = await fetch(`https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/files`, {
@@ -145,49 +144,48 @@ fastify.register(async (fastify) => {
     };
 
     const initializeSession = () => {
-      const sessionUpdate = {
-        type: 'session.update',
-        session: {
-          type: 'realtime',
-          model: 'gpt-realtime',
+      const session = {
+        type: 'realtime',
+        model: 'gpt-realtime',
 
-          // Keep text enabled until debugging is done.
-          // Once stable, you can change back to ['audio'].
-          output_modalities: ['audio', 'text'],
+        // Force audio output (avoid “text-only” responses)
+        output_modalities: ['audio'],
 
-          // KEY: turn on transcription so the model has semantic input
-          input_audio_transcription: { model: 'whisper-1' },
-
-          audio: {
-            input: {
-              format: { type: 'audio/pcmu' },
-              turn_detection: { type: 'server_vad' }
-            },
-            output: {
-              format: { type: 'audio/pcmu' },
-              voice: VOICE
-            }
+        audio: {
+          input: {
+            format: { type: 'audio/pcmu' },
+            turn_detection: { type: 'server_vad' }
           },
+          output: {
+            format: { type: 'audio/pcmu' },
+            voice: VOICE
+          }
+        },
 
-          instructions: SYSTEM_MESSAGE,
+        instructions: SYSTEM_MESSAGE,
 
-          tools: [
-            {
-              type: 'function',
-              name: 'kb_search',
-              description: 'Search the CallsAnswered.ai knowledge base and return relevant passages.',
-              parameters: {
-                type: 'object',
-                properties: { query: { type: 'string' } },
-                required: ['query']
-              }
+        tools: [
+          {
+            type: 'function',
+            name: 'kb_search',
+            description: 'Search the CallsAnswered.ai knowledge base and return relevant passages.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string' } },
+              required: ['query']
             }
-          ],
-          tool_choice: 'auto'
-        }
+          }
+        ],
+        tool_choice: 'auto'
       };
 
-      safeSendOpenAI(sessionUpdate);
+      // Optional transcription (debug/visibility)
+      const enableTx = (ENABLE_TRANSCRIPTION ?? 'true').toLowerCase() === 'true';
+      if (enableTx) {
+        session.input_audio_transcription = { model: 'whisper-1' };
+      }
+
+      safeSendOpenAI({ type: 'session.update', session });
     };
 
     const sendMark = () => {
@@ -234,13 +232,18 @@ fastify.register(async (fastify) => {
       try {
         const response = JSON.parse(data);
 
+        // Print the full error payload (this is critical)
+        if (response.type === 'error') {
+          fastify.log.error({ openai_error: response }, 'OPENAI ERROR EVENT');
+        }
+
         if (LOG_EVENT_TYPES.includes(response.type)) {
           fastify.log.info({ type: response.type, response_id: response.response_id }, 'OpenAI event');
         }
 
-        // Helpful: print transcription events so you can verify what caller said
+        // If you enabled transcription, log it (raw)
         if (response.type === 'conversation.item.input_audio_transcription.completed') {
-          fastify.log.info({ transcription_event: response }, 'TRANSCRIPTION COMPLETED (raw)');
+          fastify.log.info({ transcription: response }, 'TRANSCRIPTION COMPLETED (raw)');
         }
 
         // Track whether a response is in progress
@@ -255,12 +258,19 @@ fastify.register(async (fastify) => {
             queuedResponseCreate = false;
             requestResponseCreate('queued_after_response_done');
           }
-        } else if (response.response_id && response.type?.startsWith?.('response.')) {
+        } else if (response.response_id && typeof response.type === 'string' && response.type.startsWith('response.')) {
           responseInFlight = true;
           activeResponseId = response.response_id;
         }
 
-        if (response.type === 'response.output_audio.delta' && response.delta) {
+        // IMPORTANT: audio delta event name varies in examples/docs.
+        // Handle both to avoid silence.
+        const isAudioDelta =
+          (response.type === 'response.audio.delta' || response.type === 'response.output_audio.delta') &&
+          typeof response.delta === 'string' &&
+          response.delta.length > 0;
+
+        if (isAudioDelta) {
           connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: response.delta } }));
 
           if (!responseStartTimestampTwilio) responseStartTimestampTwilio = latestMediaTimestamp;
@@ -305,7 +315,6 @@ fastify.register(async (fastify) => {
 
             const results = kbJson?.data || kbJson?.results || kbJson?.matches || [];
 
-            // More robust extraction (different shapes exist depending on the API response)
             const passages = Array.isArray(results)
               ? results
                   .slice(0, 5)
@@ -329,7 +338,6 @@ fastify.register(async (fastify) => {
               }
             });
 
-            // Queue response.create if one is already active
             requestResponseCreate('after_kb_search_output');
           }
         }
@@ -385,7 +393,6 @@ fastify.register(async (fastify) => {
       }
     });
 
-    // IMPORTANT: avoid "WebSocket was closed before the connection was established"
     connection.on('close', () => {
       fastify.log.info('Client disconnected (Twilio WS).');
       try {
