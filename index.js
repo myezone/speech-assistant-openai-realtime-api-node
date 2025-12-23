@@ -23,7 +23,6 @@ const {
   OPENAI_PROMPT_ID,
   VECTOR_STORE_ID,
   VOICE,
-  TEMPERATURE,
   PORT,
 } = process.env;
 
@@ -46,8 +45,7 @@ fastify.register(fastifyWs);
 
 // Twilio audio is 8k mu-law; Realtime uses "audio/pcmu" (G.711 mu-law)
 const REALTIME_MODEL = "gpt-realtime";
-const DEFAULT_VOICE = VOICE || "alloy";
-const DEFAULT_TEMPERATURE = Number.isFinite(Number(TEMPERATURE)) ? Number(TEMPERATURE) : 0.8;
+const DEFAULT_VOICE = VOICE || "marin";
 const LISTEN_PORT = PORT || 10000;
 
 // Keep logs readable
@@ -223,9 +221,6 @@ fastify.register(async (fastify) => {
           prompt: {
             id: OPENAI_PROMPT_ID,
           },
-
-          // you can control creativity here (or set in Prompt if you prefer)
-          temperature: DEFAULT_TEMPERATURE,
 
           // ✅ Tool the model can call; server executes Vector Store search
           tools: [
