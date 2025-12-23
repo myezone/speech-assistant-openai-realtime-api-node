@@ -1,28 +1,42 @@
 /**
- * index.js — Twilio Media Streams ↔ OpenAI Realtime (voice-to-voice) + Vector Store kb_search
+ * index.js — Twilio Media Streams ↔ OpenAI Realtime (voice-to-voice)
+ *          + Vector Store kb_search tool
  *
- * Fixes based on your Render logs:
- *  - REMOVE session.input_audio_transcription (OpenAI rejects it)
- *  - REMOVE ranking_options.rewrite_query (Vector Store search rejects it)
- *  - Forward audio for BOTH event names: response.audio.delta and response.output_audio.delta
+ * What changed from your current file:
+ *  - Greeting + behavior moved to OpenAI Prompt (OPENAI_PROMPT_ID)
+ *  - Removed SYSTEM_MESSAGE from code
+ *  - Removed <Say> greeting from TwiML (OpenAI greets first)
+ *  - session.update uses prompt: { id: OPENAI_PROMPT_ID }
+ *  - Triggers response.create once after session.updated (to speak first)
  */
 
-import Fastify from 'fastify';
-import WebSocket from 'ws';
-import dotenv from 'dotenv';
-import fastifyFormBody from '@fastify/formbody';
-import fastifyWs from '@fastify/websocket';
+import Fastify from "fastify";
+import WebSocket from "ws";
+import dotenv from "dotenv";
+import fastifyFormBody from "@fastify/formbody";
+import fastifyWs from "@fastify/websocket";
 
 dotenv.config();
 
-const { OPENAI_API_KEY, VECTOR_STORE_ID } = process.env;
+const {
+  OPENAI_API_KEY,
+  OPENAI_PROMPT_ID,
+  VECTOR_STORE_ID,
+  VOICE,
+  TEMPERATURE,
+  PORT,
+} = process.env;
 
 if (!OPENAI_API_KEY) {
-  console.error('Missing OPENAI_API_KEY in environment variables.');
+  console.error("Missing OPENAI_API_KEY in environment variables.");
+  process.exit(1);
+}
+if (!OPENAI_PROMPT_ID) {
+  console.error("Missing OPENAI_PROMPT_ID in environment variables.");
   process.exit(1);
 }
 if (!VECTOR_STORE_ID) {
-  console.error('Missing VECTOR_STORE_ID in environment variables.');
+  console.error("Missing VECTOR_STORE_ID in environment variables.");
   process.exit(1);
 }
 
@@ -30,44 +44,42 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-const SYSTEM_MESSAGE =
-  "You are a phone support agent for CallsAnswered.ai. " +
-  "You MUST answer using ONLY the information returned by the kb_search tool. " +
-  "Before answering any user question, call kb_search with a short query. " +
-  "If the tool returns no relevant information, say: 'I don’t have that information in the knowledge base.' " +
-  "Do not use outside knowledge. Do not guess.";
-
-const VOICE = process.env.VOICE || 'alloy'; // pick a known-good default
-const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.8);
-const PORT = process.env.PORT || 10000;
+// Twilio audio is 8k mu-law; Realtime uses "audio/pcmu" (G.711 mu-law)
+const REALTIME_MODEL = "gpt-realtime";
+const DEFAULT_VOICE = VOICE || "alloy";
+const DEFAULT_TEMPERATURE = Number.isFinite(Number(TEMPERATURE)) ? Number(TEMPERATURE) : 0.8;
+const LISTEN_PORT = PORT || 10000;
 
 // Keep logs readable
 const LOG_EVENT_TYPES = new Set([
-  'error',
-  'session.created',
-  'session.updated',
-  'input_audio_buffer.speech_started',
-  'input_audio_buffer.speech_stopped',
-  'input_audio_buffer.committed',
-  'response.created',
-  'response.output_item.done',
-  'response.done',
-  'rate_limits.updated'
+  "error",
+  "session.created",
+  "session.updated",
+  "input_audio_buffer.speech_started",
+  "input_audio_buffer.speech_stopped",
+  "input_audio_buffer.committed",
+  "response.created",
+  "response.output_item.done",
+  "response.done",
+  "rate_limits.updated",
 ]);
 
-fastify.get('/', async (_request, reply) => {
-  reply.send({ message: 'Twilio Media Stream Server is running!' });
+fastify.get("/", async (_request, reply) => {
+  reply.send({ message: "Twilio Media Stream Server is running!" });
 });
 
 // Optional: quick check if vector store has files
-fastify.get('/kb-status', async (_request, reply) => {
+fastify.get("/kb-status", async (_request, reply) => {
   try {
-    const resp = await fetch(`https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/files`, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'assistants=v2'
+    const resp = await fetch(
+      `https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/files`,
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "OpenAI-Beta": "assistants=v2",
+        },
       }
-    });
+    );
 
     const json = await resp.json();
     reply.code(resp.status).send(json);
@@ -76,54 +88,76 @@ fastify.get('/kb-status', async (_request, reply) => {
   }
 });
 
-// Twilio webhook: returns TwiML that tells Twilio to open a WebSocket to /media-stream
-fastify.all('/incoming-call', async (request, reply) => {
-  const host = request.headers['x-forwarded-host'] || request.headers.host;
+// Twilio webhook: return TwiML that starts Media Stream immediately.
+// Greeting is NOT here anymore — OpenAI will greet first via your Prompt.
+fastify.all("/incoming-call", async (request, reply) => {
+  const host = request.headers["x-forwarded-host"] || request.headers.host;
 
-  // If you ever want to force wss host explicitly, override here:
-  // const host = 'YOUR_RENDER_HOST.onrender.com';
-
-  fastify.log.info({ host }, 'Twilio incoming-call host');
+  fastify.log.info({ host }, "Twilio incoming-call host");
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Chirp3-HD-Aoede">Thank you for calling CallsAnswered dot AI.</Say>
-  <Pause length="1"/>
-  <Say voice="Google.en-US-Chirp3-HD-Aoede">How can I help you?</Say>
   <Connect>
     <Stream url="wss://${host}/media-stream" />
   </Connect>
 </Response>`;
 
-  reply.code(200).type('text/xml').send(twimlResponse);
+  reply.code(200).type("text/xml").send(twimlResponse);
 });
 
-async function searchKb(query) {
-  // IMPORTANT: Your logs show ranking_options.rewrite_query is rejected.
-  const resp = await fetch(`https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/search`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-      'OpenAI-Beta': 'assistants=v2'
-    },
-    body: JSON.stringify({
-      query,
-      max_num_results: 5
-    })
-  });
+// Vector Store search used by kb_search tool
+async function vectorStoreSearch(query) {
+  const resp = await fetch(
+    `https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/search`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+        "OpenAI-Beta": "assistants=v2",
+      },
+      body: JSON.stringify({
+        query,
+        max_num_results: 5,
+        // IMPORTANT: do NOT include ranking_options.rewrite_query (your logs showed it can be rejected)
+      }),
+    }
+  );
 
+  const json = await resp.json();
   if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`KB search failed: ${resp.status} ${errText}`);
+    throw new Error(`Vector store search failed: ${resp.status} ${JSON.stringify(json)}`);
   }
+  return json;
+}
 
-  return resp.json();
+function extractPassages(vsJson) {
+  const rows = Array.isArray(vsJson?.data) ? vsJson.data : [];
+  const passages = rows
+    .slice(0, 5)
+    .map((r) => {
+      // Vector store results often have content[] segments with text
+      const contentArr = Array.isArray(r?.content) ? r.content : [];
+      const textJoined = contentArr
+        .map((c) => {
+          const t = c?.text;
+          if (typeof t === "string") return t;
+          // some shapes may be { text: { value: "..." } }
+          if (t && typeof t === "object" && typeof t.value === "string") return t.value;
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n\n");
+      return textJoined.trim();
+    })
+    .filter(Boolean);
+
+  return passages.join("\n---\n");
 }
 
 fastify.register(async (fastify) => {
-  fastify.get('/media-stream', { websocket: true }, (connection, _req) => {
-    fastify.log.info('Client connected (Twilio WS)');
+  fastify.get("/media-stream", { websocket: true }, (connection, _req) => {
+    fastify.log.info("Client connected (Twilio WS)");
 
     let streamSid = null;
     let latestMediaTimestamp = 0;
@@ -132,14 +166,20 @@ fastify.register(async (fastify) => {
     let markQueue = [];
     let responseStartTimestampTwilio = null;
 
-    // Concurrency / ordering
+    // ordering / concurrency
     let responseInFlight = false;
     let queuedResponseCreate = false;
+    let greetedThisCall = false;
+
     const handledToolCalls = new Set();
 
     const openAiWs = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`,
-      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+      `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+      }
     );
 
     const safeSendOpenAI = (obj) => {
@@ -148,56 +188,76 @@ fastify.register(async (fastify) => {
       return true;
     };
 
-    const requestResponseCreate = (reason = '') => {
+    const requestResponseCreate = (reason = "") => {
       if (responseInFlight) {
         queuedResponseCreate = true;
         return;
       }
       responseInFlight = true;
-      safeSendOpenAI({ type: 'response.create' });
-      if (reason) fastify.log.info({ reason }, 'Sent response.create');
+      safeSendOpenAI({ type: "response.create" });
+      if (reason) fastify.log.info({ reason }, "Sent response.create");
     };
 
     const initializeSession = () => {
       // Voice-to-voice ONLY — do NOT include input_audio_transcription.
       safeSendOpenAI({
-        type: 'session.update',
+        type: "session.update",
         session: {
-          type: 'realtime',
-          model: 'gpt-realtime',
-          output_modalities: ['audio'],
+          type: "realtime",
+          model: REALTIME_MODEL,
+          output_modalities: ["audio"],
+
+          // Keep formats aligned with Twilio (8k mu-law)
           audio: {
             input: {
-              format: { type: 'audio/pcmu' },
-              turn_detection: { type: 'server_vad' }
+              format: { type: "audio/pcmu", rate: 8000 },
+              turn_detection: { type: "server_vad" },
             },
             output: {
-              format: { type: 'audio/pcmu' },
-              voice: VOICE
-            }
+              format: { type: "audio/pcmu" },
+              voice: DEFAULT_VOICE,
+            },
           },
-          instructions: SYSTEM_MESSAGE,
+
+          // ✅ Move all greetings + behavior into OpenAI Prompt
+          prompt: {
+            id: OPENAI_PROMPT_ID,
+          },
+
+          // you can control creativity here (or set in Prompt if you prefer)
+          temperature: DEFAULT_TEMPERATURE,
+
+          // ✅ Tool the model can call; server executes Vector Store search
           tools: [
             {
-              type: 'function',
-              name: 'kb_search',
-              description: 'Search the CallsAnswered.ai knowledge base and return relevant passages.',
+              type: "function",
+              name: "kb_search",
+              description:
+                "Search the CallsAnswered.ai knowledge base and return relevant passages. Use this before answering factual questions.",
               parameters: {
-                type: 'object',
-                properties: { query: { type: 'string' } },
-                required: ['query']
-              }
-            }
+                type: "object",
+                properties: {
+                  query: { type: "string" },
+                },
+                required: ["query"],
+              },
+            },
           ],
-          tool_choice: 'auto'
-        }
+          tool_choice: "auto",
+        },
       });
     };
 
     const sendMark = () => {
       if (!streamSid) return;
-      connection.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'responsePart' } }));
-      markQueue.push('responsePart');
+      connection.send(
+        JSON.stringify({
+          event: "mark",
+          streamSid,
+          mark: { name: "responsePart" },
+        })
+      );
+      markQueue.push("responsePart");
     };
 
     const handleSpeechStartedEvent = () => {
@@ -207,20 +267,20 @@ fastify.register(async (fastify) => {
 
         if (lastAssistantItem) {
           safeSendOpenAI({
-            type: 'conversation.item.truncate',
+            type: "conversation.item.truncate",
             item_id: lastAssistantItem,
             content_index: 0,
-            audio_end_ms: elapsedMs
+            audio_end_ms: Math.max(0, elapsedMs),
           });
         }
 
         if (responseInFlight) {
-          safeSendOpenAI({ type: 'response.cancel' });
+          safeSendOpenAI({ type: "response.cancel" });
           responseInFlight = false;
           queuedResponseCreate = false;
         }
 
-        connection.send(JSON.stringify({ event: 'clear', streamSid }));
+        if (streamSid) connection.send(JSON.stringify({ event: "clear", streamSid }));
 
         markQueue = [];
         lastAssistantItem = null;
@@ -228,124 +288,127 @@ fastify.register(async (fastify) => {
       }
     };
 
-    openAiWs.on('open', () => {
-      fastify.log.info('Connected to the OpenAI Realtime API');
+    openAiWs.on("open", () => {
+      fastify.log.info("Connected to the OpenAI Realtime API");
       setTimeout(initializeSession, 50);
     });
 
-    openAiWs.on('message', async (data) => {
+    openAiWs.on("message", async (data) => {
       try {
-        const response = JSON.parse(data);
+        const evt = JSON.parse(data);
 
-        // Always log full OpenAI error payload
-        if (response.type === 'error') {
-          fastify.log.error({ openai_error: response }, 'OPENAI ERROR EVENT');
+        if (evt.type === "error") {
+          fastify.log.error({ openai_error: evt }, "OPENAI ERROR EVENT");
         }
 
-        if (LOG_EVENT_TYPES.has(response.type)) {
+        if (LOG_EVENT_TYPES.has(evt.type)) {
           fastify.log.info(
-            { type: response.type, response_id: response.response_id, event_id: response.event_id },
-            'OpenAI event'
+            { type: evt.type, response_id: evt.response_id, event_id: evt.event_id },
+            "OpenAI event"
           );
         }
 
         // Track response lifecycle
-        if (response.type === 'response.created') {
+        if (evt.type === "response.created") {
           responseInFlight = true;
-        } else if (response.type === 'response.done') {
+        } else if (evt.type === "response.done") {
           responseInFlight = false;
           if (queuedResponseCreate) {
             queuedResponseCreate = false;
-            requestResponseCreate('queued_after_response_done');
+            requestResponseCreate("queued_after_response_done");
           }
+        }
+
+        // ✅ Speak first: once session is updated, trigger a response (greeting comes from Prompt)
+        if (evt.type === "session.updated" && !greetedThisCall) {
+          greetedThisCall = true;
+          requestResponseCreate("initial_greeting");
         }
 
         // ✅ Forward audio to Twilio — handle BOTH event names
         const isAudioDelta =
-          (response.type === 'response.audio.delta' || response.type === 'response.output_audio.delta') &&
-          typeof response.delta === 'string' &&
-          response.delta.length > 0;
+          (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
+          typeof evt.delta === "string" &&
+          evt.delta.length > 0;
 
         if (isAudioDelta) {
-          connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: response.delta } }));
+          if (streamSid) {
+            connection.send(
+              JSON.stringify({
+                event: "media",
+                streamSid,
+                media: { payload: evt.delta },
+              })
+            );
+          }
+
           if (!responseStartTimestampTwilio) responseStartTimestampTwilio = latestMediaTimestamp;
-          if (response.item_id) lastAssistantItem = response.item_id;
+          if (evt.item_id) lastAssistantItem = evt.item_id;
           sendMark();
         }
 
         // Barge-in
-        if (response.type === 'input_audio_buffer.speech_started') {
+        if (evt.type === "input_audio_buffer.speech_started") {
           handleSpeechStartedEvent();
         }
 
         // Tool calls come through response.output_item.done
-        if (response.type === 'response.output_item.done' && response.item?.type === 'function_call') {
-          const functionCall = response.item;
+        if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
+          const functionCall = evt.item;
 
-          if (functionCall.name === 'kb_search' && functionCall.call_id) {
+          if (functionCall.name === "kb_search" && functionCall.call_id) {
             const callId = functionCall.call_id;
             if (handledToolCalls.has(callId)) return;
             handledToolCalls.add(callId);
 
-            const rawArgs = functionCall.arguments ?? functionCall.arguments_json ?? '{}';
+            const rawArgs = functionCall.arguments ?? functionCall.arguments_json ?? "{}";
             let args = {};
             try {
-              args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+              args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
             } catch {}
 
-            const query = (args?.query || '').toString().trim();
-            fastify.log.info({ query, callId }, 'kb_search tool call');
+            const query = (args?.query || "").toString().trim();
+            fastify.log.info({ query, callId }, "kb_search tool call");
 
-            let kbJson;
+            let vsJson;
             try {
-              kbJson = await searchKb(query);
+              vsJson = await vectorStoreSearch(query || "callsanswered");
             } catch (e) {
-              kbJson = { error: String(e) };
-              fastify.log.error({ err: String(e) }, 'KB search error');
+              fastify.log.error({ err: String(e) }, "KB search error");
+              vsJson = { data: [] };
             }
 
-            const results = kbJson?.data || kbJson?.results || kbJson?.matches || [];
-            const passages = Array.isArray(results)
-              ? results
-                  .slice(0, 5)
-                  .map(
-                    (r) =>
-                      r?.content?.[0]?.text?.value ??
-                      r?.content?.[0]?.text ??
-                      r?.text ??
-                      r?.document?.text ??
-                      (typeof r?.document === 'string' ? r.document : '')
-                  )
-                  .filter(Boolean)
-                  .join('\n---\n')
-              : '';
+            const passages = extractPassages(vsJson);
 
             safeSendOpenAI({
-              type: 'conversation.item.create',
+              type: "conversation.item.create",
               item: {
-                type: 'function_call_output',
+                type: "function_call_output",
                 call_id: callId,
-                output: JSON.stringify({ query, passages })
-              }
+                output: JSON.stringify({
+                  query,
+                  passages,
+                }),
+              },
             });
 
             // Ensure the model continues after tool output
-            requestResponseCreate('after_kb_search_output');
+            requestResponseCreate("after_kb_search_output");
           }
         }
       } catch (err) {
-        fastify.log.error({ err: String(err) }, 'Error processing OpenAI message');
+        fastify.log.error({ err: String(err) }, "Error processing OpenAI message");
       }
     });
 
-    connection.on('message', (message) => {
+    connection.on("message", (message) => {
       try {
         const data = JSON.parse(message);
 
         switch (data.event) {
-          case 'start':
+          case "start":
             streamSid = data.start.streamSid;
-            fastify.log.info({ streamSid }, 'Incoming stream started');
+            fastify.log.info({ streamSid }, "Incoming stream started");
 
             latestMediaTimestamp = 0;
             responseStartTimestampTwilio = null;
@@ -353,53 +416,54 @@ fastify.register(async (fastify) => {
             markQueue = [];
             responseInFlight = false;
             queuedResponseCreate = false;
+            greetedThisCall = false;
             handledToolCalls.clear();
             break;
 
-          case 'media':
+          case "media":
             latestMediaTimestamp = data.media.timestamp;
             if (openAiWs.readyState === WebSocket.OPEN) {
-              safeSendOpenAI({ type: 'input_audio_buffer.append', audio: data.media.payload });
+              safeSendOpenAI({ type: "input_audio_buffer.append", audio: data.media.payload });
             }
             break;
 
-          case 'connected':
-            fastify.log.info('Received non-media event: connected');
+          case "connected":
+            fastify.log.info("Received non-media event: connected");
             break;
 
-          case 'stop':
-            fastify.log.info('Received stop event from Twilio.');
+          case "stop":
+            fastify.log.info("Received stop event from Twilio.");
             break;
 
-          case 'mark':
+          case "mark":
             if (markQueue.length > 0) markQueue.shift();
             break;
 
           default:
-            fastify.log.info({ event: data.event }, 'Received non-media event');
+            fastify.log.info({ event: data.event }, "Received non-media event");
         }
       } catch (err) {
-        fastify.log.error({ err: String(err) }, 'Error parsing Twilio message');
+        fastify.log.error({ err: String(err) }, "Error parsing Twilio message");
       }
     });
 
-    connection.on('close', () => {
-      fastify.log.info('Client disconnected (Twilio WS).');
+    connection.on("close", () => {
+      fastify.log.info("Client disconnected (Twilio WS).");
       try {
-        if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(1000, 'twilio_disconnected');
+        if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(1000, "twilio_disconnected");
         else openAiWs.terminate();
       } catch {}
     });
 
-    openAiWs.on('close', () => fastify.log.info('Disconnected from OpenAI Realtime API'));
-    openAiWs.on('error', (e) => fastify.log.error({ err: String(e) }, 'OpenAI WS error'));
+    openAiWs.on("close", () => fastify.log.info("Disconnected from OpenAI Realtime API"));
+    openAiWs.on("error", (e) => fastify.log.error({ err: String(e) }, "OpenAI WS error"));
   });
 });
 
-fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
+fastify.listen({ port: LISTEN_PORT, host: "0.0.0.0" }, (err) => {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
-  fastify.log.info(`Server is listening on port ${PORT}`);
+  fastify.log.info(`Server is listening on port ${LISTEN_PORT}`);
 });
