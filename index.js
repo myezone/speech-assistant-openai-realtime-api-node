@@ -1,13 +1,21 @@
 /**
  * index.js — Twilio Media Streams ↔ OpenAI Realtime (voice-to-voice)
  *          + Vector Store kb_search tool
+ *          + Transcripts (caller + assistant) captured from OpenAI events
  *
- * What changed from your current file:
- *  - Greeting + behavior moved to OpenAI Prompt (OPENAI_PROMPT_ID)
- *  - Removed SYSTEM_MESSAGE from code
- *  - Removed <Say> greeting from TwiML (OpenAI greets first)
- *  - session.update uses prompt: { id: OPENAI_PROMPT_ID }
- *  - Triggers response.create once after session.updated (to speak first)
+ * Access transcripts at:
+ *   GET /transcripts/latest
+ *   GET /transcripts/:streamSid
+ *
+ * Env vars required:
+ *   OPENAI_API_KEY
+ *   OPENAI_PROMPT_ID
+ *   VECTOR_STORE_ID
+ *
+ * Optional:
+ *   PORT (default 10000)
+ *   VOICE (default "alloy")
+ *   OPENAI_TRANSCRIPTION_MODEL (default "whisper-1")
  */
 
 import Fastify from "fastify";
@@ -24,6 +32,7 @@ const {
   VECTOR_STORE_ID,
   VOICE,
   PORT,
+  OPENAI_TRANSCRIPTION_MODEL,
 } = process.env;
 
 if (!OPENAI_API_KEY) {
@@ -43,27 +52,39 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// Twilio audio is 8k mu-law; Realtime uses "audio/pcmu" (G.711 mu-law)
-const REALTIME_MODEL = "gpt-realtime";
-const DEFAULT_VOICE = VOICE || "marin";
 const LISTEN_PORT = PORT || 10000;
+const REALTIME_MODEL = "gpt-realtime";
+const DEFAULT_VOICE = VOICE || "alloy";
+const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
 
-// Keep logs readable
-const LOG_EVENT_TYPES = new Set([
-  "error",
-  "session.created",
-  "session.updated",
-  "input_audio_buffer.speech_started",
-  "input_audio_buffer.speech_stopped",
-  "input_audio_buffer.committed",
-  "response.created",
-  "response.output_item.done",
-  "response.done",
-  "rate_limits.updated",
-]);
+// In-memory transcript store (resets on deploy / restart)
+const transcriptsByStreamSid = new Map(); // streamSid -> { callSid, startedAt, endedAt, turns: [{role,text,ts}], events: [] }
+let latestStreamSid = null;
 
-fastify.get("/", async (_request, reply) => {
-  reply.send({ message: "Twilio Media Stream Server is running!" });
+/**
+ * Twilio mu-law is 8k, 8-bit => 8000 bytes/sec => ~8 bytes/ms.
+ * For audio/pcmu the bytes-per-ms is roughly 8.
+ */
+const PCMU_BYTES_PER_MS = 8;
+
+fastify.get("/", async (_req, reply) => {
+  reply.send({ ok: true, message: "Voice IVA server running" });
+});
+
+// See latest transcript (JSON)
+fastify.get("/transcripts/latest", async (_req, reply) => {
+  if (!latestStreamSid || !transcriptsByStreamSid.has(latestStreamSid)) {
+    return reply.code(404).send({ error: "No transcripts yet." });
+  }
+  return reply.send(transcriptsByStreamSid.get(latestStreamSid));
+});
+
+// See transcript by streamSid
+fastify.get("/transcripts/:streamSid", async (req, reply) => {
+  const { streamSid } = req.params;
+  const data = transcriptsByStreamSid.get(streamSid);
+  if (!data) return reply.code(404).send({ error: "Not found" });
+  return reply.send(data);
 });
 
 // Optional: quick check if vector store has files
@@ -78,7 +99,6 @@ fastify.get("/kb-status", async (_request, reply) => {
         },
       }
     );
-
     const json = await resp.json();
     reply.code(resp.status).send(json);
   } catch (e) {
@@ -87,10 +107,9 @@ fastify.get("/kb-status", async (_request, reply) => {
 });
 
 // Twilio webhook: return TwiML that starts Media Stream immediately.
-// Greeting is NOT here anymore — OpenAI will greet first via your Prompt.
+// Greeting is NOT here — OpenAI greets first using your OPENAI_PROMPT_ID.
 fastify.all("/incoming-call", async (request, reply) => {
   const host = request.headers["x-forwarded-host"] || request.headers.host;
-
   fastify.log.info({ host }, "Twilio incoming-call host");
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
@@ -117,7 +136,6 @@ async function vectorStoreSearch(query) {
       body: JSON.stringify({
         query,
         max_num_results: 5,
-        // IMPORTANT: do NOT include ranking_options.rewrite_query (your logs showed it can be rejected)
       }),
     }
   );
@@ -134,13 +152,11 @@ function extractPassages(vsJson) {
   const passages = rows
     .slice(0, 5)
     .map((r) => {
-      // Vector store results often have content[] segments with text
       const contentArr = Array.isArray(r?.content) ? r.content : [];
       const textJoined = contentArr
         .map((c) => {
           const t = c?.text;
           if (typeof t === "string") return t;
-          // some shapes may be { text: { value: "..." } }
           if (t && typeof t === "object" && typeof t.value === "string") return t.value;
           return "";
         })
@@ -158,26 +174,30 @@ fastify.register(async (fastify) => {
     fastify.log.info("Client connected (Twilio WS)");
 
     let streamSid = null;
+    let callSid = null;
     let latestMediaTimestamp = 0;
 
+    // assistant audio tracking (for safe truncation)
     let lastAssistantItem = null;
-    let markQueue = [];
+    const assistantAudioMsByItem = new Map(); // item_id -> ms sent so far
     let responseStartTimestampTwilio = null;
+    let markQueue = [];
 
-    // ordering / concurrency
+    // response ordering
     let responseInFlight = false;
     let queuedResponseCreate = false;
     let greetedThisCall = false;
 
+    // tool call dedupe
     const handledToolCalls = new Set();
+
+    // transcript buffers for streaming deltas
+    const userTranscriptBufferByItem = new Map();       // item_id -> accumulated text
+    const assistantTranscriptBufferByResp = new Map();  // response_id -> accumulated text
 
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-        },
-      }
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
 
     const safeSendOpenAI = (obj) => {
@@ -197,7 +217,9 @@ fastify.register(async (fastify) => {
     };
 
     const initializeSession = () => {
-      // Voice-to-voice ONLY — do NOT include input_audio_transcription.
+      // IMPORTANT:
+      // - No "rate" field under audio/pcmu formats (OpenAI rejects it)
+      // - Enable input transcription here
       safeSendOpenAI({
         type: "session.update",
         session: {
@@ -205,24 +227,24 @@ fastify.register(async (fastify) => {
           model: REALTIME_MODEL,
           output_modalities: ["audio"],
 
-          // Keep formats aligned with Twilio (8k mu-law)
           audio: {
             input: {
               format: { type: "audio/pcmu" },
               turn_detection: { type: "server_vad" },
+
+              // ✅ caller transcription
+              transcription: { model: TRANSCRIPTION_MODEL },
             },
             output: {
               format: { type: "audio/pcmu" },
-              voice: VOICE,
+              voice: DEFAULT_VOICE,
             },
           },
 
-          // ✅ Move all greetings + behavior into OpenAI Prompt
-          prompt: {
-            id: OPENAI_PROMPT_ID,
-          },
+          // ✅ prompt controls greeting + behavior
+          prompt: { id: OPENAI_PROMPT_ID },
 
-          // ✅ Tool the model can call; server executes Vector Store search
+          // ✅ tool for KB search
           tools: [
             {
               type: "function",
@@ -231,9 +253,7 @@ fastify.register(async (fastify) => {
                 "Search the CallsAnswered.ai knowledge base and return relevant passages. Use this before answering factual questions.",
               parameters: {
                 type: "object",
-                properties: {
-                  query: { type: "string" },
-                },
+                properties: { query: { type: "string" } },
                 required: ["query"],
               },
             },
@@ -241,6 +261,33 @@ fastify.register(async (fastify) => {
           tool_choice: "auto",
         },
       });
+    };
+
+    const ensureTranscriptRecord = () => {
+      if (!streamSid) return null;
+      if (!transcriptsByStreamSid.has(streamSid)) {
+        transcriptsByStreamSid.set(streamSid, {
+          streamSid,
+          callSid: callSid || null,
+          startedAt: Date.now(),
+          endedAt: null,
+          turns: [],
+        });
+        latestStreamSid = streamSid;
+      }
+      return transcriptsByStreamSid.get(streamSid);
+    };
+
+    const addTurn = (role, text) => {
+      const rec = ensureTranscriptRecord();
+      if (!rec) return;
+      const clean = (text || "").trim();
+      if (!clean) return;
+      rec.turns.push({ role, text: clean, ts: Date.now() });
+
+      // Also visible in Render logs
+      if (role === "user") fastify.log.info({ streamSid, user: clean }, "USER TRANSCRIPT");
+      if (role === "assistant") fastify.log.info({ streamSid, assistant: clean }, "ASSISTANT TRANSCRIPT");
     };
 
     const sendMark = () => {
@@ -255,32 +302,36 @@ fastify.register(async (fastify) => {
       markQueue.push("responsePart");
     };
 
-    const handleSpeechStartedEvent = () => {
-      // Barge-in: stop assistant audio and cancel in-flight response
-      if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-        const elapsedMs = latestMediaTimestamp - responseStartTimestampTwilio;
+    const handleBargeIn = () => {
+      if (!lastAssistantItem || responseStartTimestampTwilio == null) return;
 
-        if (lastAssistantItem) {
-          safeSendOpenAI({
-            type: "conversation.item.truncate",
-            item_id: lastAssistantItem,
-            content_index: 0,
-            audio_end_ms: Math.max(0, elapsedMs),
-          });
-        }
+      const elapsedMs = latestMediaTimestamp - responseStartTimestampTwilio;
+      const sentMs = assistantAudioMsByItem.get(lastAssistantItem) || 0;
 
-        if (responseInFlight) {
-          safeSendOpenAI({ type: "response.cancel" });
-          responseInFlight = false;
-          queuedResponseCreate = false;
-        }
+      // Clamp truncate to audio that was actually emitted.
+      // Subtract a tiny guard (50ms) to avoid "already shorter" errors.
+      const safeEndMs = Math.max(0, Math.min(elapsedMs, Math.max(0, sentMs - 50)));
 
-        if (streamSid) connection.send(JSON.stringify({ event: "clear", streamSid }));
-
-        markQueue = [];
-        lastAssistantItem = null;
-        responseStartTimestampTwilio = null;
+      // If we haven't emitted enough audio to truncate safely, just cancel/clear.
+      if (safeEndMs > 0) {
+        safeSendOpenAI({
+          type: "conversation.item.truncate",
+          item_id: lastAssistantItem,
+          content_index: 0,
+          audio_end_ms: safeEndMs,
+        });
       }
+
+      safeSendOpenAI({ type: "response.cancel" });
+      responseInFlight = false;
+      queuedResponseCreate = false;
+
+      if (streamSid) connection.send(JSON.stringify({ event: "clear", streamSid }));
+
+      markQueue = [];
+      lastAssistantItem = null;
+      responseStartTimestampTwilio = null;
+      assistantAudioMsByItem.clear();
     };
 
     openAiWs.on("open", () => {
@@ -296,13 +347,6 @@ fastify.register(async (fastify) => {
           fastify.log.error({ openai_error: evt }, "OPENAI ERROR EVENT");
         }
 
-        if (LOG_EVENT_TYPES.has(evt.type)) {
-          fastify.log.info(
-            { type: evt.type, response_id: evt.response_id, event_id: evt.event_id },
-            "OpenAI event"
-          );
-        }
-
         // Track response lifecycle
         if (evt.type === "response.created") {
           responseInFlight = true;
@@ -314,13 +358,43 @@ fastify.register(async (fastify) => {
           }
         }
 
-        // ✅ Speak first: once session is updated, trigger a response (greeting comes from Prompt)
+        // Speak first after session config
         if (evt.type === "session.updated" && !greetedThisCall) {
           greetedThisCall = true;
           requestResponseCreate("initial_greeting");
         }
 
-        // ✅ Forward audio to Twilio — handle BOTH event names
+        // ✅ Caller transcription (streaming)
+        if (evt.type === "conversation.item.input_audio_transcription.delta") {
+          const itemId = evt.item_id;
+          const delta = evt.delta || "";
+          const prev = userTranscriptBufferByItem.get(itemId) || "";
+          userTranscriptBufferByItem.set(itemId, prev + delta);
+        }
+
+        if (evt.type === "conversation.item.input_audio_transcription.completed") {
+          const itemId = evt.item_id;
+          const finalText = (evt.transcript || userTranscriptBufferByItem.get(itemId) || "").trim();
+          userTranscriptBufferByItem.delete(itemId);
+          if (finalText) addTurn("user", finalText);
+        }
+
+        // ✅ Assistant transcript of its spoken audio (streaming)
+        if (evt.type === "response.output_audio_transcript.delta") {
+          const rid = evt.response_id;
+          const delta = evt.delta || "";
+          const prev = assistantTranscriptBufferByResp.get(rid) || "";
+          assistantTranscriptBufferByResp.set(rid, prev + delta);
+        }
+
+        if (evt.type === "response.output_audio_transcript.done") {
+          const rid = evt.response_id;
+          const finalText = (evt.transcript || assistantTranscriptBufferByResp.get(rid) || "").trim();
+          assistantTranscriptBufferByResp.delete(rid);
+          if (finalText) addTurn("assistant", finalText);
+        }
+
+        // ✅ Forward assistant audio to Twilio (handle both event names recall)
         const isAudioDelta =
           (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
           typeof evt.delta === "string" &&
@@ -337,17 +411,33 @@ fastify.register(async (fastify) => {
             );
           }
 
-          if (!responseStartTimestampTwilio) responseStartTimestampTwilio = latestMediaTimestamp;
-          if (evt.item_id) lastAssistantItem = evt.item_id;
+          // Establish response start timing on first audio output
+          if (responseStartTimestampTwilio == null) responseStartTimestampTwilio = latestMediaTimestamp;
+
+          // Track which assistant item we are speaking
+          if (evt.item_id) {
+            lastAssistantItem = evt.item_id;
+
+            // estimate how many ms we've emitted for this item
+            // base64 length -> bytes: (len * 3/4) minus padding; rough is ok for clamping
+            const b64 = evt.delta;
+            const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+            const bytes = Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
+            const ms = Math.floor(bytes / PCMU_BYTES_PER_MS);
+
+            const prevMs = assistantAudioMsByItem.get(evt.item_id) || 0;
+            assistantAudioMsByItem.set(evt.item_id, prevMs + ms);
+          }
+
           sendMark();
         }
 
-        // Barge-in
+        // Barge-in signal
         if (evt.type === "input_audio_buffer.speech_started") {
-          handleSpeechStartedEvent();
+          handleBargeIn();
         }
 
-        // Tool calls come through response.output_item.done
+        // Tool calls arrive via response.output_item.done
         if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
           const functionCall = evt.item;
 
@@ -360,7 +450,9 @@ fastify.register(async (fastify) => {
             let args = {};
             try {
               args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
-            } catch {}
+            } catch {
+              args = {};
+            }
 
             const query = (args?.query || "").toString().trim();
             fastify.log.info({ query, callId }, "kb_search tool call");
@@ -380,14 +472,10 @@ fastify.register(async (fastify) => {
               item: {
                 type: "function_call_output",
                 call_id: callId,
-                output: JSON.stringify({
-                  query,
-                  passages,
-                }),
+                output: JSON.stringify({ query, passages }),
               },
             });
 
-            // Ensure the model continues after tool output
             requestResponseCreate("after_kb_search_output");
           }
         }
@@ -403,16 +491,25 @@ fastify.register(async (fastify) => {
         switch (data.event) {
           case "start":
             streamSid = data.start.streamSid;
-            fastify.log.info({ streamSid }, "Incoming stream started");
+            callSid = data.start.callSid || data.start?.callSid || null;
+            latestStreamSid = streamSid;
 
+            fastify.log.info({ streamSid, callSid }, "Incoming stream started");
             latestMediaTimestamp = 0;
-            responseStartTimestampTwilio = null;
+
+            // reset per-call state
             lastAssistantItem = null;
+            assistantAudioMsByItem.clear();
+            responseStartTimestampTwilio = null;
             markQueue = [];
             responseInFlight = false;
             queuedResponseCreate = false;
             greetedThisCall = false;
             handledToolCalls.clear();
+            userTranscriptBufferByItem.clear();
+            assistantTranscriptBufferByResp.clear();
+
+            ensureTranscriptRecord();
             break;
 
           case "media":
@@ -444,6 +541,19 @@ fastify.register(async (fastify) => {
 
     connection.on("close", () => {
       fastify.log.info("Client disconnected (Twilio WS).");
+
+      // finalize transcript record
+      if (streamSid && transcriptsByStreamSid.has(streamSid)) {
+        const rec = transcriptsByStreamSid.get(streamSid);
+        rec.endedAt = Date.now();
+        rec.callSid = rec.callSid || callSid || null;
+
+        fastify.log.info(
+          { streamSid, callSid: rec.callSid, turns: rec.turns.length },
+          "CALL TRANSCRIPT SUMMARY"
+        );
+      }
+
       try {
         if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(1000, "twilio_disconnected");
         else openAiWs.terminate();
