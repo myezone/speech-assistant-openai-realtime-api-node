@@ -178,13 +178,6 @@ fastify.register(async (fastify) => {
         ],
         tool_choice: 'auto'
       };
-
-      // Optional transcription (debug/visibility)
-      const enableTx = (ENABLE_TRANSCRIPTION ?? 'true').toLowerCase() === 'true';
-      if (enableTx) {
-        session.input_audio_transcription = { model: 'whisper-1' };
-      }
-
       safeSendOpenAI({ type: 'session.update', session });
     };
 
