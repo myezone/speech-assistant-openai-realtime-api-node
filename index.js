@@ -208,12 +208,12 @@ fastify.register(async (fastify) => {
           // Keep formats aligned with Twilio (8k mu-law)
           audio: {
             input: {
-              format: { type: "audio/pcmu", rate: 8000 },
+              format: { type: "audio/pcmu" },
               turn_detection: { type: "server_vad" },
             },
             output: {
               format: { type: "audio/pcmu" },
-              voice: DEFAULT_VOICE,
+              voice: VOICE,
             },
           },
 
