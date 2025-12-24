@@ -17,7 +17,7 @@
  *
  * OPTIONAL env vars:
  *  - PORT (default 10000)
- *  - VOICE (default "alloy")
+ *  - VOICE (default "marin")
  *  - OPENAI_TRANSCRIPTION_MODEL (default "whisper-1")
  *  - MAX_TRANSCRIPTS (default 50)  // in-memory retention
  */
