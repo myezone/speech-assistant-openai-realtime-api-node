@@ -26,6 +26,7 @@ import WebSocket from "ws";
 import dotenv from "dotenv";
 import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
+import { upsertCallStart, completeCall } from "./callLog.js";
 
 dotenv.config();
 
@@ -171,6 +172,25 @@ fastify.get("/kb-status", async (_req, reply) => {
 
 // Twilio webhook
 fastify.all("/incoming-call", async (request, reply) => {
+  // Twilio sends x-www-form-urlencoded; @fastify/formbody is already registered above ✅
+  const callId = request.body?.CallSid || request.query?.CallSid || null;
+  const from = request.body?.From || request.query?.From || null;
+  const to = request.body?.To || request.query?.To || null;
+
+  try {
+    fastify.log.info({ callId, from, to }, "✅ /incoming-call HIT");
+
+    // Only write if we have a CallSid (Twilio will always provide this on real calls)
+    if (callId) {
+      await upsertCallStart({ callId, from, to });
+      fastify.log.info({ callId }, "✅ DB INSERT OK (call start)");
+    } else {
+      fastify.log.warn({ body: request.body, query: request.query }, "⚠️ No CallSid found on /incoming-call");
+    }
+  } catch (err) {
+    fastify.log.error({ err: String(err), callId }, "❌ DB INSERT FAILED (call start)");
+  }
+
   const host =
     PUBLIC_HOST ||
     request.headers["x-forwarded-host"] ||
@@ -185,6 +205,7 @@ fastify.all("/incoming-call", async (request, reply) => {
 
   reply.code(200).type("text/xml").send(twiml);
 });
+
 
 async function vectorStoreSearch(query) {
   const resp = await fetch(`https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/search`, {
