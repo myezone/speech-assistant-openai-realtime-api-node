@@ -297,11 +297,11 @@ fastify.register(async (fastify) => {
           output_modalities: ["audio"],
           audio: {
             input: {
-              format: { type: "audio/pcmu" },
+              format: { type: "g711_ulaw" },
               turn_detection: { type: "server_vad" },
               transcription: { model: TRANSCRIPTION_MODEL },
             },
-            output: { format: { type: "audio/pcmu" }, voice: DEFAULT_VOICE },
+            output: { format: { type: "g711_ulaw" }, voice: DEFAULT_VOICE },
           },
           prompt: { id: OPENAI_PROMPT_ID },
           tools: [
