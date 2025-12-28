@@ -16,23 +16,53 @@ export async function upsertCallStart({ callId, from, to }) {
 }
 
 export async function logUtterance({ callId, role, text }) {
-  if (!text?.trim()) return;
+  if (!callId) return;
+  if (!text || !text.trim()) return;
+
   await pool.query(
     `INSERT INTO call_utterances (call_id, role, text) VALUES ($1, $2, $3)`,
     [callId, role, text.trim()]
   );
 }
 
-export async function completeCall({ callId, status, durationSeconds }) {
+export async function setCallDurationFallback({ callId, durationSeconds }) {
+  if (!callId) return;
   await pool.query(
     `
     UPDATE calls
-    SET status = $2,
-        ended_at = NOW(),
-        duration_seconds = $3,
+    SET duration_seconds = COALESCE(duration_seconds, $2),
         updated_at = NOW()
     WHERE call_id = $1
     `,
-    [callId, status, durationSeconds]
+    [callId, durationSeconds]
+  );
+}
+
+export async function saveCallSummary({ callId, summaryText, summaryJson }) {
+  if (!callId) return;
+  await pool.query(
+    `
+    UPDATE calls
+    SET summary_text = $2,
+        summary_json = $3,
+        updated_at = NOW()
+    WHERE call_id = $1
+    `,
+    [callId, summaryText || null, summaryJson || null]
+  );
+}
+
+export async function setOfficialCallDuration({ callId, durationSeconds, status }) {
+  if (!callId) return;
+  await pool.query(
+    `
+    UPDATE calls
+    SET duration_seconds = $2,
+        status = COALESCE($3, status),
+        ended_at = NOW(),
+        updated_at = NOW()
+    WHERE call_id = $1
+    `,
+    [callId, durationSeconds, status || null]
   );
 }
