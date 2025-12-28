@@ -43,6 +43,123 @@ const REALTIME_MODEL = "gpt-realtime";
 const DEFAULT_VOICE = VOICE || "marin";
 const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
 const RETAIN_MAX = Math.max(1, Math.min(500, Number(MAX_TRANSCRIPTS) || 50));
+/** -----------------------------
+ * In-memory transcript store
+ * ----------------------------- */
+const transcriptsByStreamSid = new Map(); // streamSid -> record
+const transcriptOrder = []; // oldest -> newest
+let latestStreamSid = null;
+
+function retainIfNeeded() {
+  while (transcriptOrder.length > RETAIN_MAX) {
+    const sid = transcriptOrder.shift();
+    if (sid) transcriptsByStreamSid.delete(sid);
+  }
+}
+
+function getOrCreateTranscript(streamSid) {
+  if (!streamSid) return null;
+  let rec = transcriptsByStreamSid.get(streamSid);
+  if (!rec) {
+    rec = {
+      streamSid,
+      callSid: null, // Twilio CallSid (CA...)
+      startedAt: Date.now(),
+      endedAt: null,
+      durationMs: null,
+      turns: [], // { role: 'user'|'assistant', text, ts }
+      summarySaved: false,
+    };
+    transcriptsByStreamSid.set(streamSid, rec);
+    transcriptOrder.push(streamSid);
+    latestStreamSid = streamSid;
+    retainIfNeeded();
+  }
+  return rec;
+}
+
+/** DB write for each turn (non-blocking) */
+function persistTurn(rec, role, text) {
+  const callSid = rec?.callSid;
+  if (!callSid) return;
+
+  const dbRole = role === "user" ? "caller" : "agent";
+
+  void logUtterance({ callId: callSid, role: dbRole, text }).catch((e) => {
+    fastify.log.error({ callSid, err: String(e) }, "logUtterance failed");
+  });
+}
+
+function addTurn(streamSid, role, text) {
+  const rec = getOrCreateTranscript(streamSid);
+  if (!rec) return;
+
+  const clean = (text || "").trim();
+  if (!clean) return;
+
+  const now = Date.now();
+  const last = rec.turns.length ? rec.turns[rec.turns.length - 1] : null;
+
+  // Merge short fragments if same role within 1.2s
+  if (last && last.role === role && now - last.ts <= 1200) {
+    if (last.text.length < 40 || clean.length < 40) {
+      last.text = `${last.text} ${clean}`.trim();
+      last.ts = now;
+    } else {
+      rec.turns.push({ role, text: clean, ts: now });
+    }
+  } else {
+    rec.turns.push({ role, text: clean, ts: now });
+  }
+
+  if (role === "user") fastify.log.info({ streamSid, user: clean }, "USER TRANSCRIPT");
+  if (role === "assistant") fastify.log.info({ streamSid, assistant: clean }, "ASSISTANT TRANSCRIPT");
+
+  // write to DB
+  persistTurn(rec, role, clean);
+}
+
+/** Persist summary + fallback duration once at end of call */
+function finalizeCallIfPossible(streamSid, fallbackCallSid = null) {
+  const rec = streamSid ? transcriptsByStreamSid.get(streamSid) : null;
+  if (!rec) return;
+
+  if (!rec.endedAt) {
+    rec.endedAt = Date.now();
+    rec.durationMs = rec.endedAt - rec.startedAt;
+  }
+
+  rec.callSid = rec.callSid || fallbackCallSid || null;
+  const callSid = rec.callSid;
+
+  if (!callSid || rec.summarySaved) return;
+  rec.summarySaved = true;
+
+  const turns = rec.turns?.length || 0;
+  const durationSeconds = Math.max(0, Math.round((rec.durationMs || 0) / 1000));
+
+  // simple summary text
+  const firstUser = rec.turns.find((t) => t.role === "user")?.text || "";
+  const lastAgent = [...rec.turns].reverse().find((t) => t.role === "assistant")?.text || "";
+  const summaryText =
+    `Caller: ${firstUser}`.slice(0, 400) +
+    (lastAgent ? ` | Agent: ${lastAgent}`.slice(0, 400) : "");
+
+  fastify.log.info({ streamSid, callSid, durationMs: rec.durationMs, turns }, "CALL TRANSCRIPT SUMMARY");
+
+  void setCallDurationFallback({ callId: callSid, durationSeconds }).catch((e) => {
+    fastify.log.error({ callSid, err: String(e) }, "setCallDurationFallback failed");
+  });
+
+  void saveCallSummary({
+    callId: callSid,
+    summaryText: summaryText || `Call ended. Turns: ${turns}. Duration: ${durationSeconds}s.`,
+    summaryJson: { turns, durationMs: rec.durationMs, durationSeconds },
+  }).catch((e) => {
+    fastify.log.error({ callSid, err: String(e) }, "saveCallSummary failed");
+  });
+}
+
 
 /** -----------------------------
  * In-memory transcript store
