@@ -162,34 +162,6 @@ function getOrCreateTranscript(streamSid) {
   return rec;
 }
 
-function addTurn(streamSid, role, text) {
-  const rec = getOrCreateTranscript(streamSid);
-  if (!rec) return;
-
-  const clean = (text || "").trim();
-  if (!clean) return;
-
-  const now = Date.now();
-  const last = rec.turns.length ? rec.turns[rec.turns.length - 1] : null;
-
-  // Merge short fragments if same role within 1.2s
-  if (last && last.role === role && now - last.ts <= 1200) {
-    if (last.text.length < 40 || clean.length < 40) {
-      last.text = `${last.text} ${clean}`.trim();
-      last.ts = now;
-    } else {
-      rec.turns.push({ role, text: clean, ts: now });
-    }
-  } else {
-    rec.turns.push({ role, text: clean, ts: now });
-  }
-
-  if (role === "user") fastify.log.info({ streamSid, user: clean }, "USER TRANSCRIPT");
-  if (role === "assistant") fastify.log.info({ streamSid, assistant: clean }, "ASSISTANT TRANSCRIPT");
-
-  // ✅ write to DB
-  persistTurn(rec, role, clean);
-}
 /** -----------------------------
  * Basic routes
  * ----------------------------- */
