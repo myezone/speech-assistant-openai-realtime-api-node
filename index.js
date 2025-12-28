@@ -650,3 +650,21 @@ fastify.listen({ port: LISTEN_PORT, host: "0.0.0.0" }, (err) => {
   }
   fastify.log.info(`Server is listening on port ${LISTEN_PORT}`);
 });
+
+// Twilio Call Status Callback
+fastify.post("/twilio/call-status", async (req, reply) => {
+  const callId = req.body.CallSid;
+  const callStatus = req.body.CallStatus; // completed, in-progress, etc.
+  const callDuration = Number(req.body.CallDuration || 0); // only present on completed
+
+  // Only finalize duration when completed
+  if (callStatus === "completed") {
+    await completeCall({
+      callId,
+      status: callStatus,
+      durationSeconds: callDuration,
+    });
+  }
+
+  return reply.code(200).send("ok");
+});
