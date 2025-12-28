@@ -43,40 +43,6 @@ const REALTIME_MODEL = "gpt-realtime";
 const DEFAULT_VOICE = VOICE || "marin";
 const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
 const RETAIN_MAX = Math.max(1, Math.min(500, Number(MAX_TRANSCRIPTS) || 50));
-/** -----------------------------
- * In-memory transcript store
- * ----------------------------- */
-const transcriptsByStreamSid = new Map(); // streamSid -> record
-const transcriptOrder = []; // oldest -> newest
-let latestStreamSid = null;
-
-function retainIfNeeded() {
-  while (transcriptOrder.length > RETAIN_MAX) {
-    const sid = transcriptOrder.shift();
-    if (sid) transcriptsByStreamSid.delete(sid);
-  }
-}
-
-function getOrCreateTranscript(streamSid) {
-  if (!streamSid) return null;
-  let rec = transcriptsByStreamSid.get(streamSid);
-  if (!rec) {
-    rec = {
-      streamSid,
-      callSid: null, // Twilio CallSid (CA...)
-      startedAt: Date.now(),
-      endedAt: null,
-      durationMs: null,
-      turns: [], // { role: 'user'|'assistant', text, ts }
-      summarySaved: false,
-    };
-    transcriptsByStreamSid.set(streamSid, rec);
-    transcriptOrder.push(streamSid);
-    latestStreamSid = streamSid;
-    retainIfNeeded();
-  }
-  return rec;
-}
 
 /** DB write for each turn (non-blocking) */
 function persistTurn(rec, role, text) {
