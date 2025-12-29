@@ -356,7 +356,6 @@ fastify.register(async (fastify) => {
             return;}
           if (evt.type === "response.output_audio.delta") {
             fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "OPENAI AUDIO DELTA");
-            ...
           }
         // Caller transcript deltas/completed
         if (evt.type === "conversation.item.input_audio_transcription.delta") {
