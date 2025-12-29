@@ -1,14 +1,13 @@
 /**
- * index.js — Twilio Media Streams ↔ OpenAI Realtime (minimal baseline)
+ * index.js — Twilio Media Streams ↔ OpenAI Realtime (minimal)
  *
- * Clean baseline version with NO logging functionality.
- * All database logging has been removed to AI_logging.js
- *
- * Features:
+ * Included recommendations only:
  * - Single OpenAI audio delta handler (no duplicates)
+ * - No illegal top-level `return;`
  * - session.update shaped for Twilio (g711_ulaw, server_vad, transcription)
  * - Single safe Twilio send path (checks WS readyState)
- * - Two debug logs only
+ *
+ * Plus: exactly TWO debug logs.
  */
 
 import Fastify from "fastify";
@@ -16,6 +15,14 @@ import WebSocket from "ws";
 import dotenv from "dotenv";
 import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
+
+import {
+  upsertCallStart,
+  logUtterance,
+  saveCallSummary,
+  setCallDurationFallback,
+  setOfficialCallDuration,
+} from "./callLog.js";
 
 dotenv.config();
 
@@ -45,6 +52,57 @@ const REALTIME_MODEL = "gpt-realtime";
 const DEFAULT_VOICE = VOICE || "marin";
 const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
 
+/** --------- Minimal transcript aggregation (per callSid) --------- */
+const callStateByStreamSid = new Map(); // streamSid -> { callSid, startedAt, turns: [{role,text,ts}] }
+
+function getOrCreateState(streamSid) {
+  if (!streamSid) return null;
+  let st = callStateByStreamSid.get(streamSid);
+  if (!st) {
+    st = { callSid: null, startedAt: Date.now(), turns: [] };
+    callStateByStreamSid.set(streamSid, st);
+  }
+  return st;
+}
+
+function addTurn(streamSid, role, text) {
+  const st = getOrCreateState(streamSid);
+  if (!st) return;
+
+  const clean = String(text || "").trim();
+  if (!clean) return;
+
+  st.turns.push({ role, text: clean, ts: Date.now() });
+
+  if (st.callSid) {
+    const dbRole = role === "user" ? "caller" : "agent";
+    void logUtterance({ callId: st.callSid, role: dbRole, text: clean }).catch(() => {});
+  }
+}
+
+function finalizeCall(streamSid) {
+  const st = callStateByStreamSid.get(streamSid);
+  if (!st || !st.callSid) return;
+
+  const durationMs = Math.max(0, Date.now() - st.startedAt);
+  const durationSeconds = Math.max(0, Math.round(durationMs / 1000));
+  const turns = st.turns.length;
+
+  const firstUser = st.turns.find((t) => t.role === "user")?.text || "";
+  const lastAgent = [...st.turns].reverse().find((t) => t.role === "assistant")?.text || "";
+  const summaryText =
+    `Caller: ${firstUser}`.slice(0, 400) + (lastAgent ? ` | Agent: ${lastAgent}`.slice(0, 400) : "");
+
+  void setCallDurationFallback({ callId: st.callSid, durationSeconds }).catch(() => {});
+  void saveCallSummary({
+    callId: st.callSid,
+    summaryText: summaryText || `Call ended. Turns: ${turns}. Duration: ${durationSeconds}s.`,
+    summaryJson: { turns, durationMs, durationSeconds },
+  }).catch(() => {});
+
+  callStateByStreamSid.delete(streamSid);
+}
+
 /** -----------------------------
  * Basic routes
  * ----------------------------- */
@@ -54,6 +112,17 @@ fastify.get("/", async (_req, reply) => reply.send({ ok: true }));
  * Twilio webhook: incoming call -> TwiML Stream
  * ----------------------------- */
 fastify.all("/incoming-call", async (request, reply) => {
+  const callId = request.body?.CallSid || request.query?.CallSid || null;
+  const from = request.body?.From || request.query?.From || null;
+  const to = request.body?.To || request.query?.To || null;
+
+  if (callId) {
+    // keep DB write, but no extra logging
+    try {
+      await upsertCallStart({ callId, from, to });
+    } catch {}
+  }
+
   const host = PUBLIC_HOST || request.headers["x-forwarded-host"] || request.headers.host;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -70,6 +139,20 @@ fastify.all("/incoming-call", async (request, reply) => {
  * Twilio status callback
  * ----------------------------- */
 fastify.post("/twilio/call-status", async (req, reply) => {
+  try {
+    const callId = req.body?.CallSid;
+    const callStatus = req.body?.CallStatus;
+    const callDuration = Number(req.body?.CallDuration || 0);
+
+    if (callId && callStatus === "completed") {
+      await setOfficialCallDuration({
+        callId,
+        durationSeconds: callDuration,
+        status: callStatus,
+      });
+    }
+  } catch {}
+
   return reply.code(200).send("ok");
 });
 
@@ -100,7 +183,7 @@ fastify.register(async (fastify) => {
       twilioWs.send(JSON.stringify(obj));
       return true;
     };
-
+   
     const initializeSession = () => {
       safeSendOpenAI({
         type: "session.update",
@@ -108,9 +191,9 @@ fastify.register(async (fastify) => {
           model: REALTIME_MODEL,
           modalities: ["audio"],
           voice: DEFAULT_VOICE,
-          // Twilio Media Streams audio format (8kHz µ-law) - pcm16 vs. g711_ulaw
-          input_audio_format: "pcm16", 
-          output_audio_format: "pcm16",
+          // Twilio Media Streams audio format (8kHz µ-law)
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
           turn_detection: { type: "server_vad" },
           input_audio_transcription: { model: TRANSCRIPTION_MODEL },
           prompt: { id: OPENAI_PROMPT_ID },
@@ -157,7 +240,7 @@ fastify.register(async (fastify) => {
           const itemId = evt.item_id;
           const finalText = (evt.transcript || userTranscriptBufByItem.get(itemId) || "").trim();
           userTranscriptBufByItem.delete(itemId);
-          // Transcript captured but not logged (logging removed)
+          if (finalText) addTurn(streamSid, "user", finalText);
           return;
         }
 
@@ -173,7 +256,7 @@ fastify.register(async (fastify) => {
           const rid = evt.response_id;
           const finalText = (evt.transcript || assistantTranscriptBufByResp.get(rid) || "").trim();
           assistantTranscriptBufByResp.delete(rid);
-          // Transcript captured but not logged (logging removed)
+          if (finalText) addTurn(streamSid, "assistant", finalText);
           return;
         }
       } catch {
@@ -189,6 +272,9 @@ fastify.register(async (fastify) => {
           streamSid = data.start.streamSid;
           callSid = data.start.callSid || null;
 
+          const st = getOrCreateState(streamSid);
+          if (st) st.callSid = callSid;
+
           // DEBUG LOG #2 (only)
           fastify.log.debug({ streamSid, callSid }, "debug: twilio_stream_started");
           return;
@@ -200,7 +286,7 @@ fastify.register(async (fastify) => {
         }
 
         if (data.event === "stop") {
-          // Stream stopped (logging removed)
+          finalizeCall(streamSid);
           return;
         }
       } catch {
@@ -212,6 +298,7 @@ fastify.register(async (fastify) => {
     if (typeof connection.on === "function") {
       connection.on("message", onTwilioMessage);
       connection.on("close", () => {
+        finalizeCall(streamSid);
         try {
           if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
         } catch {}
@@ -219,6 +306,7 @@ fastify.register(async (fastify) => {
     } else if (connection.socket && typeof connection.socket.on === "function") {
       connection.socket.on("message", onTwilioMessage);
       connection.socket.on("close", () => {
+        finalizeCall(streamSid);
         try {
           if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
         } catch {}
