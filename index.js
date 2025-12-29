@@ -108,9 +108,9 @@ fastify.register(async (fastify) => {
           model: REALTIME_MODEL,
           modalities: ["audio"],
           voice: DEFAULT_VOICE,
-          // Twilio Media Streams audio format (8kHz µ-law)
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
+          // Twilio Media Streams audio format (8kHz µ-law) - pcm16 vs. g711_ulaw
+          input_audio_format: "pcm16", 
+          output_audio_format: "pcm16",
           turn_detection: { type: "server_vad" },
           input_audio_transcription: { model: TRANSCRIPTION_MODEL },
           prompt: { id: OPENAI_PROMPT_ID },
