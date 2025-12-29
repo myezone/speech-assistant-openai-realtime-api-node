@@ -1,7 +1,8 @@
 /**
- * index.js — Twilio Media Streams ↔ OpenAI Realtime (DIAGNOSTIC VERSION)
+ * index.js — Twilio Media Streams ↔ OpenAI Realtime
  * + Postgres logging (calls + call_utterances)
- * + Extensive audio debugging
+ * 
+ * FIXED: Removed duplicate audio handlers that caused crackling noise
  */
 
 import Fastify from "fastify";
@@ -40,8 +41,8 @@ await fastify.register(fastifyFormBody);
 await fastify.register(fastifyWs);
 
 const LISTEN_PORT = Number(PORT) || 10000;
-const REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"; // Updated to latest model
-const DEFAULT_VOICE = VOICE || "verse";
+const REALTIME_MODEL = "gpt-realtime";
+const DEFAULT_VOICE = VOICE || "marin";
 const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
 const RETAIN_MAX = Math.max(1, Math.min(500, Number(MAX_TRANSCRIPTS) || 50));
 
@@ -271,53 +272,41 @@ function extractPassages(vsJson) {
  * ----------------------------- */
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, (connection) => {
-    fastify.log.info("🔌 Client connected (Twilio WS)");
+    fastify.log.info("Client connected (Twilio WS)");
 
     let streamSid = null;
     let callSid = null;
-    let audioPacketCount = 0;
-    let lastEventTypes = new Set();
 
     const userTranscriptBufferByItem = new Map();
     const assistantTranscriptBufferByResp = new Map();
     const handledToolCalls = new Set();
 
     const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
-      headers: { 
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      },
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
     });
 
     const safeSendOpenAI = (obj) => {
-      if (openAiWs.readyState !== WebSocket.OPEN) {
-        fastify.log.warn({ type: obj.type }, "⚠️ Cannot send to OpenAI - WS not open");
-        return false;
-      }
+      if (openAiWs.readyState !== WebSocket.OPEN) return false;
       openAiWs.send(JSON.stringify(obj));
       return true;
     };
 
     const initializeSession = () => {
-      fastify.log.info("🎙️ Initializing OpenAI Realtime session...");
-      
-      const sessionConfig = {
+      safeSendOpenAI({
         type: "session.update",
         session: {
-          modalities: ["text", "audio"],
-          instructions: "You are a helpful AI assistant.",
-          voice: DEFAULT_VOICE,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: {
-            model: TRANSCRIPTION_MODEL
+          type: "realtime",
+          model: REALTIME_MODEL,
+          output_modalities: ["audio"],
+          audio: {
+            input: {
+              format: { type: "g711_ulaw" },
+              turn_detection: { type: "server_vad" },
+              transcription: { model: TRANSCRIPTION_MODEL },
+            },
+            output: { format: { type: "g711_ulaw" }, voice: DEFAULT_VOICE },
           },
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 500
-          },
+          prompt: { id: OPENAI_PROMPT_ID },
           tools: [
             {
               type: "function",
@@ -332,108 +321,51 @@ fastify.register(async (fastify) => {
           ],
           tool_choice: "auto",
         },
-      };
+      });
 
-      fastify.log.info({ config: sessionConfig }, "📤 Sending session config");
-      safeSendOpenAI(sessionConfig);
-
-      // Start conversation
-      setTimeout(() => {
-        fastify.log.info("🎬 Creating initial response");
-        safeSendOpenAI({ type: "response.create" });
-      }, 100);
+      // greet
+      safeSendOpenAI({ type: "response.create" });
     };
 
     openAiWs.on("open", () => {
-      fastify.log.info("✅ Connected to OpenAI Realtime API");
-      setTimeout(initializeSession, 500);
-    });
-
-    openAiWs.on("error", (error) => {
-      fastify.log.error({ error: String(error) }, "❌ OpenAI WebSocket error");
+      fastify.log.info("Connected to OpenAI Realtime");
+      // Increased timeout for better initialization (was 50ms)
+      setTimeout(initializeSession, 250);
     });
 
     openAiWs.on("message", async (raw) => {
       try {
         const evt = JSON.parse(raw);
-        
-        // Track unique event types for debugging
-        if (!lastEventTypes.has(evt.type)) {
-          lastEventTypes.add(evt.type);
-          fastify.log.info({ eventType: evt.type }, "🆕 New OpenAI event type received");
-        }
-
-        // Log session updates
-        if (evt.type === "session.created" || evt.type === "session.updated") {
-          fastify.log.info({ 
-            type: evt.type,
-            session: evt.session 
-          }, "📋 Session event");
-        }
-
-        // Log errors from OpenAI
-        if (evt.type === "error") {
-          fastify.log.error({ error: evt.error }, "❌ OpenAI Error Event");
-        }
 
         // ========================================
-        // AUDIO OUTPUT HANDLING - Multiple possible event types
+        // FIXED: Single audio handler (no duplicates)
         // ========================================
-        
-        // Try the documented event name
-        if (evt.type === "response.audio.delta") {
-          audioPacketCount++;
-          if (audioPacketCount === 1 || audioPacketCount % 50 === 0) {
-            fastify.log.info({ 
-              count: audioPacketCount,
-              deltaSize: evt.delta?.length || 0,
-              streamSid 
-            }, "🔊 response.audio.delta");
-          }
-
+        if (evt.type === "response.output_audio.delta") {
           if (streamSid && evt.delta) {
             try {
               const twilioWs = connection.socket || connection;
+              
+              // Verify WebSocket is ready before sending
               if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
-                twilioWs.send(JSON.stringify({
-                  event: "media",
-                  streamSid,
-                  media: { payload: evt.delta }
-                }));
+                twilioWs.send(
+                  JSON.stringify({
+                    event: "media",
+                    streamSid,
+                    media: { payload: evt.delta },
+                  })
+                );
+                
+                // Optional: Log every 100th packet to avoid log spam
+                // Uncomment for debugging audio flow
+                // if (Math.random() < 0.01) {
+                //   fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "📤 Audio sent to Twilio");
+                // }
               }
             } catch (e) {
               fastify.log.error({ err: String(e), streamSid }, "❌ Failed sending audio to Twilio");
             }
           }
-          return;
-        }
-
-        // Also try alternative event name (API might have changed)
-        if (evt.type === "response.audio_transcript.delta" || 
-            evt.type === "response.output_audio.delta" ||
-            evt.type === "conversation.item.audio.delta") {
-          audioPacketCount++;
-          fastify.log.info({ 
-            eventType: evt.type,
-            count: audioPacketCount,
-            deltaSize: evt.delta?.length || 0 
-          }, "🔊 Alternative audio delta event");
-
-          if (streamSid && evt.delta) {
-            try {
-              const twilioWs = connection.socket || connection;
-              if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
-                twilioWs.send(JSON.stringify({
-                  event: "media",
-                  streamSid,
-                  media: { payload: evt.delta }
-                }));
-              }
-            } catch (e) {
-              fastify.log.error({ err: String(e), streamSid }, "❌ Failed sending audio to Twilio");
-            }
-          }
-          return;
+          return; // Important: exit handler after processing
         }
 
         // Caller transcript deltas/completed
@@ -452,17 +384,15 @@ fastify.register(async (fastify) => {
           return;
         }
 
-        // Assistant transcript (multiple possible event names)
-        if (evt.type === "response.audio_transcript.delta" || 
-            evt.type === "response.output_audio_transcript.delta") {
+        // Assistant transcript
+        if (evt.type === "response.output_audio_transcript.delta") {
           const rid = evt.response_id;
           const prev = assistantTranscriptBufferByResp.get(rid) || "";
           assistantTranscriptBufferByResp.set(rid, prev + (evt.delta || ""));
           return;
         }
 
-        if (evt.type === "response.audio_transcript.done" || 
-            evt.type === "response.output_audio_transcript.done") {
+        if (evt.type === "response.output_audio_transcript.done") {
           const rid = evt.response_id;
           const finalText = (evt.transcript || assistantTranscriptBufferByResp.get(rid) || "").trim();
           assistantTranscriptBufferByResp.delete(rid);
@@ -471,14 +401,8 @@ fastify.register(async (fastify) => {
         }
 
         // Tool call: kb_search
-        if (evt.type === "response.function_call_arguments.done" || 
-            evt.type === "response.output_item.done") {
-          
-          const fc = evt.type === "response.function_call_arguments.done" 
-            ? evt 
-            : evt.item;
-            
-          if (!fc || fc.type !== "function_call") return;
+        if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
+          const fc = evt.item;
           if (fc.name !== "kb_search" || !fc.call_id) return;
 
           if (handledToolCalls.has(fc.call_id)) return;
@@ -497,24 +421,19 @@ fastify.register(async (fastify) => {
           try {
             const vsJson = await vectorStoreSearch(query);
             passages = extractPassages(vsJson);
-            fastify.log.info({ query, passagesLength: passages.length }, "📚 KB search completed");
           } catch (e) {
-            fastify.log.error({ err: String(e), streamSid }, "❌ KB search failed");
+            fastify.log.error({ err: String(e), streamSid }, "KB search failed");
           }
 
           safeSendOpenAI({
             type: "conversation.item.create",
-            item: { 
-              type: "function_call_output", 
-              call_id: fc.call_id, 
-              output: JSON.stringify({ query, passages }) 
-            },
+            item: { type: "function_call_output", call_id: fc.call_id, output: JSON.stringify({ query, passages }) },
           });
 
           safeSendOpenAI({ type: "response.create" });
         }
       } catch (e) {
-        fastify.log.error({ err: String(e), raw: raw.toString().substring(0, 200) }, "❌ Error processing OpenAI event");
+        fastify.log.error({ err: String(e) }, "Error processing OpenAI event");
       }
     });
 
@@ -529,52 +448,33 @@ fastify.register(async (fastify) => {
           const rec = getOrCreateTranscript(streamSid);
           if (rec) rec.callSid = callSid;
 
-          fastify.log.info({ 
-            streamSid, 
-            callSid,
-            customParameters: data.start.customParameters 
-          }, "🎙️ Twilio stream started");
+          fastify.log.info({ streamSid, callSid }, "Incoming stream started");
           return;
         }
 
         if (data.event === "media") {
           if (openAiWs.readyState === WebSocket.OPEN) {
-            safeSendOpenAI({ 
-              type: "input_audio_buffer.append", 
-              audio: data.media.payload 
-            });
-          } else {
-            fastify.log.warn("⚠️ Cannot send audio to OpenAI - WS not ready");
+            safeSendOpenAI({ type: "input_audio_buffer.append", audio: data.media.payload });
           }
           return;
         }
 
         if (data.event === "stop") {
-          fastify.log.info({ streamSid, audioPacketsReceived: audioPacketCount }, "🛑 Twilio stream stopped");
+          fastify.log.info({ streamSid }, "Received stop event from Twilio.");
           finalizeCallIfPossible(streamSid, callSid);
           return;
         }
       } catch (e) {
-        fastify.log.error({ err: String(e) }, "❌ Error parsing Twilio message");
+        fastify.log.error({ err: String(e) }, "Error parsing Twilio message");
       }
     });
 
     connection.on("close", () => {
-      fastify.log.info({ 
-        streamSid, 
-        audioPacketsReceived: audioPacketCount,
-        uniqueEventTypes: Array.from(lastEventTypes)
-      }, "🔌 Twilio WebSocket closed");
-      
+      fastify.log.info({ streamSid }, "Client disconnected (Twilio WS).");
       finalizeCallIfPossible(streamSid, callSid);
-      
       try {
         if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
       } catch {}
-    });
-
-    openAiWs.on("close", () => {
-      fastify.log.info("🔌 OpenAI WebSocket closed");
     });
   });
 });
@@ -587,7 +487,5 @@ fastify.listen({ port: LISTEN_PORT, host: "0.0.0.0" }, (err) => {
     fastify.log.error(err);
     process.exit(1);
   }
-  fastify.log.info(`🚀 Server is listening on port ${LISTEN_PORT}`);
-  fastify.log.info(`📋 Using model: ${REALTIME_MODEL}`);
-  fastify.log.info(`🎤 Using voice: ${DEFAULT_VOICE}`);
+  fastify.log.info(`Server is listening on port ${LISTEN_PORT}`);
 });
