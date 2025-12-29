@@ -181,13 +181,11 @@ if (evt.type === "response.output_audio.delta") {
       fastify.log.error({ err: String(e), streamSid }, "Failed sending audio to Twilio");
     }
   }
-  return;
-}
+  return;}
 if (evt.type === "response.output_audio.delta") {
   fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "OPENAI AUDIO DELTA");
   ...
 }
-
 
 /** -----------------------------
  * Basic routes
