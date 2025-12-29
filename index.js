@@ -1,7 +1,7 @@
 /**
  * index.js — Twilio Media Streams ↔ OpenAI Realtime
  * + Postgres logging (calls + call_utterances)
- * 
+ *
  * FIXED: Removed duplicate audio handlers that caused crackling noise
  */
 
@@ -110,8 +110,7 @@ function finalizeCallIfPossible(streamSid, fallbackCallSid = null) {
   const firstUser = rec.turns.find((t) => t.role === "user")?.text || "";
   const lastAgent = [...rec.turns].reverse().find((t) => t.role === "assistant")?.text || "";
   const summaryText =
-    `Caller: ${firstUser}`.slice(0, 400) +
-    (lastAgent ? ` | Agent: ${lastAgent}`.slice(0, 400) : "");
+    `Caller: ${firstUser}`.slice(0, 400) + (lastAgent ? ` | Agent: ${lastAgent}`.slice(0, 400) : "");
 
   fastify.log.info({ streamSid, callSid, durationMs: rec.durationMs, turns }, "CALL TRANSCRIPT SUMMARY");
 
@@ -127,7 +126,6 @@ function finalizeCallIfPossible(streamSid, fallbackCallSid = null) {
     fastify.log.error({ callSid, err: String(e) }, "saveCallSummary failed");
   });
 }
-
 
 /** -----------------------------
  * In-memory transcript store
@@ -291,43 +289,42 @@ fastify.register(async (fastify) => {
       return true;
     };
 
-const initializeSession = () => {
-  safeSendOpenAI({
-    type: "session.update",
-    session: {
-      model: REALTIME_MODEL,
-      modalities: ["audio"],
-      voice: DEFAULT_VOICE,
+    const initializeSession = () => {
+      safeSendOpenAI({
+        type: "session.update",
+        session: {
+          model: REALTIME_MODEL,
+          modalities: ["audio"],
+          voice: DEFAULT_VOICE,
 
-      // ✅ Important for Twilio Media Streams (8kHz µ-law)
-      input_audio_format: "g711_ulaw",
-      output_audio_format: "g711_ulaw",
+          // ✅ Important for Twilio Media Streams (8kHz µ-law)
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
 
-      turn_detection: { type: "server_vad" },
-      input_audio_transcription: { model: TRANSCRIPTION_MODEL },
+          turn_detection: { type: "server_vad" },
+          input_audio_transcription: { model: TRANSCRIPTION_MODEL },
 
-      // keep your prompt id if you want
-      prompt: { id: OPENAI_PROMPT_ID },
+          // keep your prompt id if you want
+          prompt: { id: OPENAI_PROMPT_ID },
 
-      tools: [
-        {
-          type: "function",
-          name: "kb_search",
-          description: "Search the CallsAnswered.ai knowledge base and return relevant passages.",
-          parameters: {
-            type: "object",
-            properties: { query: { type: "string" } },
-            required: ["query"],
-          },
+          tools: [
+            {
+              type: "function",
+              name: "kb_search",
+              description: "Search the CallsAnswered.ai knowledge base and return relevant passages.",
+              parameters: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+              },
+            },
+          ],
+          tool_choice: "auto",
         },
-      ],
-      tool_choice: "auto",
-    },
-  });
+      });
 
-  safeSendOpenAI({ type: "response.create" });
-};
-
+      safeSendOpenAI({ type: "response.create" });
+    };
 
     openAiWs.on("open", () => {
       fastify.log.info("Connected to OpenAI Realtime");
@@ -346,7 +343,7 @@ const initializeSession = () => {
           if (streamSid && evt.delta) {
             try {
               const twilioWs = connection.socket || connection;
-              
+
               // Verify WebSocket is ready before sending
               if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
                 twilioWs.send(
@@ -356,12 +353,6 @@ const initializeSession = () => {
                     media: { payload: evt.delta },
                   })
                 );
-                
-                // Optional: Log every 100th packet to avoid log spam
-                // Uncomment for debugging audio flow
-                // if (Math.random() < 0.01) {
-                //   fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "📤 Audio sent to Twilio");
-                // }
               }
             } catch (e) {
               fastify.log.error({ err: String(e), streamSid }, "❌ Failed sending audio to Twilio");
@@ -429,7 +420,11 @@ const initializeSession = () => {
 
           safeSendOpenAI({
             type: "conversation.item.create",
-            item: { type: "function_call_output", call_id: fc.call_id, output: JSON.stringify({ query, passages }) },
+            item: {
+              type: "function_call_output",
+              call_id: fc.call_id,
+              output: JSON.stringify({ query, passages }),
+            },
           });
 
           safeSendOpenAI({ type: "response.create" });
