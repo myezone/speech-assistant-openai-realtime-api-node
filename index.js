@@ -184,29 +184,55 @@ fastify.register(async (fastify) => {
       return true;
     };
 
-    const initializeSession = () => {
-      safeSendOpenAI({
-        type: "session.update",
-        session: {
-          model: REALTIME_MODEL,
-          modalities: ["audio"],
-          voice: DEFAULT_VOICE,
+  const initializeSession = () => {
+  safeSendOpenAI({
+    type: "session.update",
+    session: {
+      model: REALTIME_MODEL,
+      // IMPORTANT: allow text too (helps the model stay grounded)
+      modalities: ["audio", "text"],
 
-          // Twilio Media Streams audio format (8kHz µ-law)
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
+      voice: DEFAULT_VOICE,
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
 
-          turn_detection: { type: "server_vad" },
-          input_audio_transcription: { model: TRANSCRIPTION_MODEL },
+      turn_detection: { type: "server_vad" },
+      input_audio_transcription: { model: TRANSCRIPTION_MODEL },
 
-          prompt: { id: OPENAI_PROMPT_ID },
-        },
-      });
+      // 👇 hard constraints to stop random languages + hallucinations
+      instructions: [
+        "You are CallsAnswered.ai, a phone voice assistant.",
+        "Speak English by default. Only switch languages if the caller clearly speaks another language first.",
+        "Do NOT describe seeing images or a physical scene. You have no vision.",
+        "Start by greeting and asking how you can help. Keep responses short and natural for a phone call.",
+      ].join("\n"),
+    },
+  });
 
-      // greet
-      safeSendOpenAI({ type: "response.create" });
-    };
+  safeSendOpenAI({ type: "response.create" });
+};
 
+    
+/**    const initializeSession = () => {
+*      safeSendOpenAI({
+*        type: "session.update",
+*        session: {
+*          model: REALTIME_MODEL,
+*          modalities: ["audio"],
+*          voice: DEFAULT_VOICE,
+*          // Twilio Media Streams audio format (8kHz µ-law)
+*          input_audio_format: "g711_ulaw",
+*          output_audio_format: "g711_ulaw",
+*          turn_detection: { type: "server_vad" },
+*          input_audio_transcription: { model: TRANSCRIPTION_MODEL },
+*          prompt: { id: OPENAI_PROMPT_ID },
+*        },
+*      });
+*
+*      // greet
+*      safeSendOpenAI({ type: "response.create" });
+*    };
+*/
     openAiWs.on("open", () => {
       // DEBUG LOG #1 (only)
       fastify.log.debug({ streamSid }, "debug: openai_ws_open");
