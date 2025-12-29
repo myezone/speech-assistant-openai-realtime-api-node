@@ -1,6 +1,8 @@
 /**
  * index.js — Twilio Media Streams ↔ OpenAI Realtime
  * + Postgres logging (calls + call_utterances)
+ * 
+ * FIXED: Removed duplicate audio handlers that caused crackling noise
  */
 
 import Fastify from "fastify";
@@ -327,36 +329,45 @@ fastify.register(async (fastify) => {
 
     openAiWs.on("open", () => {
       fastify.log.info("Connected to OpenAI Realtime");
-      setTimeout(initializeSession, 50);
+      // Increased timeout for better initialization (was 50ms)
+      setTimeout(initializeSession, 250);
     });
 
     openAiWs.on("message", async (raw) => {
       try {
         const evt = JSON.parse(raw);
 
-        // --- OpenAI -> Twilio audio ---
-          if (evt.type === "response.output_audio.delta") {
-            // OpenAI sends base64 audio in evt.delta (g711_ulaw per your session config)
-            if (streamSid) {
-              const payload = evt.delta; // already base64
-              try {
-                // fastify websocket plugin sometimes provides connection.socket; be safe:
-                const twilioWs = connection.socket || connection;
+        // ========================================
+        // FIXED: Single audio handler (no duplicates)
+        // ========================================
+        if (evt.type === "response.output_audio.delta") {
+          if (streamSid && evt.delta) {
+            try {
+              const twilioWs = connection.socket || connection;
+              
+              // Verify WebSocket is ready before sending
+              if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
                 twilioWs.send(
                   JSON.stringify({
                     event: "media",
                     streamSid,
-                    media: { payload },
+                    media: { payload: evt.delta },
                   })
                 );
-              } catch (e) {
-                fastify.log.error({ err: String(e), streamSid }, "Failed sending audio to Twilio");
+                
+                // Optional: Log every 100th packet to avoid log spam
+                // Uncomment for debugging audio flow
+                // if (Math.random() < 0.01) {
+                //   fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "📤 Audio sent to Twilio");
+                // }
               }
+            } catch (e) {
+              fastify.log.error({ err: String(e), streamSid }, "❌ Failed sending audio to Twilio");
             }
-            return;}
-          if (evt.type === "response.output_audio.delta") {
-            fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "OPENAI AUDIO DELTA");
           }
+          return; // Important: exit handler after processing
+        }
+
         // Caller transcript deltas/completed
         if (evt.type === "conversation.item.input_audio_transcription.delta") {
           const itemId = evt.item_id;
