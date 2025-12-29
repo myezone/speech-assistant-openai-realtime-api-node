@@ -1,12 +1,13 @@
 /**
- * index.js — Twilio Media Streams ↔ OpenAI Realtime
- * + Postgres logging (calls + call_utterances)
+ * index.js — Twilio Media Streams ↔ OpenAI Realtime (minimal)
  *
- * Recommended fixes applied:
- * - Removed duplicate OpenAI audio delta handlers (prevents crackling + double-send)
- * - Removed illegal top-level `return;` patterns
- * - Cleaned up session.update to the current Realtime shape for Twilio (g711_ulaw, server_vad, transcription)
- * - Kept a single, safe Twilio send path (checks WS readyState)
+ * Included recommendations only:
+ * - Single OpenAI audio delta handler (no duplicates)
+ * - No illegal top-level `return;`
+ * - session.update shaped for Twilio (g711_ulaw, server_vad, transcription)
+ * - Single safe Twilio send path (checks WS readyState)
+ *
+ * Plus: exactly TWO debug logs.
  */
 
 import Fastify from "fastify";
@@ -28,19 +29,21 @@ dotenv.config();
 const {
   OPENAI_API_KEY,
   OPENAI_PROMPT_ID,
-  VECTOR_STORE_ID,
   PORT,
   VOICE,
   OPENAI_TRANSCRIPTION_MODEL,
-  MAX_TRANSCRIPTS,
   PUBLIC_HOST,
 } = process.env;
 
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 if (!OPENAI_PROMPT_ID) throw new Error("Missing OPENAI_PROMPT_ID");
-if (!VECTOR_STORE_ID) throw new Error("Missing VECTOR_STORE_ID");
 
-const fastify = Fastify({ logger: true });
+const fastify = Fastify({
+  logger: {
+    level: process.env.LOG_LEVEL || "info", // set to "debug" to see the 2 debug logs
+  },
+});
+
 await fastify.register(fastifyFormBody);
 await fastify.register(fastifyWs);
 
@@ -48,133 +51,62 @@ const LISTEN_PORT = Number(PORT) || 10000;
 const REALTIME_MODEL = "gpt-realtime";
 const DEFAULT_VOICE = VOICE || "marin";
 const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
-const RETAIN_MAX = Math.max(1, Math.min(500, Number(MAX_TRANSCRIPTS) || 50));
 
-/** -----------------------------
- * In-memory transcript store
- * ----------------------------- */
-const transcriptsByStreamSid = new Map(); // streamSid -> record
-const transcriptOrder = []; // oldest -> newest
-let latestStreamSid = null;
+/** --------- Minimal transcript aggregation (per callSid) --------- */
+const callStateByStreamSid = new Map(); // streamSid -> { callSid, startedAt, turns: [{role,text,ts}] }
 
-function retainIfNeeded() {
-  while (transcriptOrder.length > RETAIN_MAX) {
-    const sid = transcriptOrder.shift();
-    if (sid) transcriptsByStreamSid.delete(sid);
-  }
-}
-
-function getOrCreateTranscript(streamSid) {
+function getOrCreateState(streamSid) {
   if (!streamSid) return null;
-  let rec = transcriptsByStreamSid.get(streamSid);
-  if (!rec) {
-    rec = {
-      streamSid,
-      callSid: null, // Twilio CallSid (CA...)
-      startedAt: Date.now(),
-      endedAt: null,
-      durationMs: null,
-      turns: [], // { role: 'user'|'assistant', text, ts }
-      summarySaved: false,
-    };
-    transcriptsByStreamSid.set(streamSid, rec);
-    transcriptOrder.push(streamSid);
-    latestStreamSid = streamSid;
-    retainIfNeeded();
+  let st = callStateByStreamSid.get(streamSid);
+  if (!st) {
+    st = { callSid: null, startedAt: Date.now(), turns: [] };
+    callStateByStreamSid.set(streamSid, st);
   }
-  return rec;
-}
-
-/** DB write for each turn (non-blocking) */
-function persistTurn(rec, role, text) {
-  const callSid = rec?.callSid;
-  if (!callSid) return;
-
-  const dbRole = role === "user" ? "caller" : "agent";
-
-  void logUtterance({ callId: callSid, role: dbRole, text }).catch((e) => {
-    fastify.log.error({ callSid, err: String(e) }, "logUtterance failed");
-  });
+  return st;
 }
 
 function addTurn(streamSid, role, text) {
-  const rec = getOrCreateTranscript(streamSid);
-  if (!rec) return;
+  const st = getOrCreateState(streamSid);
+  if (!st) return;
 
-  const clean = (text || "").trim();
+  const clean = String(text || "").trim();
   if (!clean) return;
 
-  const now = Date.now();
-  const last = rec.turns.length ? rec.turns[rec.turns.length - 1] : null;
+  st.turns.push({ role, text: clean, ts: Date.now() });
 
-  // Merge short fragments if same role within 1.2s
-  if (last && last.role === role && now - last.ts <= 1200) {
-    if (last.text.length < 40 || clean.length < 40) {
-      last.text = `${last.text} ${clean}`.trim();
-      last.ts = now;
-    } else {
-      rec.turns.push({ role, text: clean, ts: now });
-    }
-  } else {
-    rec.turns.push({ role, text: clean, ts: now });
+  if (st.callSid) {
+    const dbRole = role === "user" ? "caller" : "agent";
+    void logUtterance({ callId: st.callSid, role: dbRole, text: clean }).catch(() => {});
   }
-
-  if (role === "user") fastify.log.info({ streamSid, user: clean }, "USER TRANSCRIPT");
-  if (role === "assistant") fastify.log.info({ streamSid, assistant: clean }, "ASSISTANT TRANSCRIPT");
-
-  persistTurn(rec, role, clean);
 }
 
-/** Persist summary + fallback duration once at end of call */
-function finalizeCallIfPossible(streamSid, fallbackCallSid = null) {
-  const rec = streamSid ? transcriptsByStreamSid.get(streamSid) : null;
-  if (!rec) return;
+function finalizeCall(streamSid) {
+  const st = callStateByStreamSid.get(streamSid);
+  if (!st || !st.callSid) return;
 
-  if (!rec.endedAt) {
-    rec.endedAt = Date.now();
-    rec.durationMs = rec.endedAt - rec.startedAt;
-  }
+  const durationMs = Math.max(0, Date.now() - st.startedAt);
+  const durationSeconds = Math.max(0, Math.round(durationMs / 1000));
+  const turns = st.turns.length;
 
-  rec.callSid = rec.callSid || fallbackCallSid || null;
-  const callSid = rec.callSid;
-
-  if (!callSid || rec.summarySaved) return;
-  rec.summarySaved = true;
-
-  const turns = rec.turns?.length || 0;
-  const durationSeconds = Math.max(0, Math.round((rec.durationMs || 0) / 1000));
-
-  const firstUser = rec.turns.find((t) => t.role === "user")?.text || "";
-  const lastAgent = [...rec.turns].reverse().find((t) => t.role === "assistant")?.text || "";
+  const firstUser = st.turns.find((t) => t.role === "user")?.text || "";
+  const lastAgent = [...st.turns].reverse().find((t) => t.role === "assistant")?.text || "";
   const summaryText =
     `Caller: ${firstUser}`.slice(0, 400) + (lastAgent ? ` | Agent: ${lastAgent}`.slice(0, 400) : "");
 
-  fastify.log.info({ streamSid, callSid, durationMs: rec.durationMs, turns }, "CALL TRANSCRIPT SUMMARY");
-
-  void setCallDurationFallback({ callId: callSid, durationSeconds }).catch((e) => {
-    fastify.log.error({ callSid, err: String(e) }, "setCallDurationFallback failed");
-  });
-
+  void setCallDurationFallback({ callId: st.callSid, durationSeconds }).catch(() => {});
   void saveCallSummary({
-    callId: callSid,
+    callId: st.callSid,
     summaryText: summaryText || `Call ended. Turns: ${turns}. Duration: ${durationSeconds}s.`,
-    summaryJson: { turns, durationMs: rec.durationMs, durationSeconds },
-  }).catch((e) => {
-    fastify.log.error({ callSid, err: String(e) }, "saveCallSummary failed");
-  });
+    summaryJson: { turns, durationMs, durationSeconds },
+  }).catch(() => {});
+
+  callStateByStreamSid.delete(streamSid);
 }
 
 /** -----------------------------
  * Basic routes
  * ----------------------------- */
-fastify.get("/", async (_req, reply) => reply.send({ ok: true, service: "Voice IVA" }));
-
-fastify.get("/transcripts/latest", async (_req, reply) => {
-  if (!latestStreamSid) return reply.code(404).send({ error: "No transcripts yet." });
-  const rec = transcriptsByStreamSid.get(latestStreamSid);
-  if (!rec) return reply.code(404).send({ error: "No transcripts yet." });
-  return reply.send(rec);
-});
+fastify.get("/", async (_req, reply) => reply.send({ ok: true }));
 
 /** -----------------------------
  * Twilio webhook: incoming call -> TwiML Stream
@@ -184,14 +116,11 @@ fastify.all("/incoming-call", async (request, reply) => {
   const from = request.body?.From || request.query?.From || null;
   const to = request.body?.To || request.query?.To || null;
 
-  try {
-    fastify.log.info({ callId, from, to }, "✅ /incoming-call HIT");
-    if (callId) {
+  if (callId) {
+    // keep DB write, but no extra logging
+    try {
       await upsertCallStart({ callId, from, to });
-      fastify.log.info({ callId }, "✅ DB INSERT OK (call start)");
-    }
-  } catch (err) {
-    fastify.log.error({ err: String(err), callId }, "❌ DB INSERT FAILED (call start)");
+    } catch {}
   }
 
   const host = PUBLIC_HOST || request.headers["x-forwarded-host"] || request.headers.host;
@@ -215,71 +144,28 @@ fastify.post("/twilio/call-status", async (req, reply) => {
     const callStatus = req.body?.CallStatus;
     const callDuration = Number(req.body?.CallDuration || 0);
 
-    if (callStatus === "completed") {
+    if (callId && callStatus === "completed") {
       await setOfficialCallDuration({
         callId,
         durationSeconds: callDuration,
         status: callStatus,
       });
-      fastify.log.info({ callId, callDuration }, "✅ Official duration saved (Twilio completed)");
     }
-  } catch (err) {
-    fastify.log.error({ err: String(err) }, "❌ /twilio/call-status failed");
-  }
+  } catch {}
 
   return reply.code(200).send("ok");
 });
-
-/** -----------------------------
- * OpenAI vector store search
- * ----------------------------- */
-async function vectorStoreSearch(query) {
-  const resp = await fetch(`https://api.openai.com/v1/vector_stores/${VECTOR_STORE_ID}/search`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-      "OpenAI-Beta": "assistants=v2",
-    },
-    body: JSON.stringify({ query, max_num_results: 5 }),
-  });
-
-  const json = await resp.json();
-  if (!resp.ok) throw new Error(`Vector store search failed: ${resp.status} ${JSON.stringify(json)}`);
-  return json;
-}
-
-function extractPassages(vsJson) {
-  const rows = Array.isArray(vsJson?.data) ? vsJson.data : [];
-  const passages = rows
-    .slice(0, 5)
-    .map((r) => {
-      const contentArr = Array.isArray(r?.content) ? r.content : [];
-      const text = contentArr
-        .map((c) => (typeof c?.text === "string" ? c.text : c?.text?.value || ""))
-        .filter(Boolean)
-        .join("\n\n")
-        .trim();
-      return text;
-    })
-    .filter(Boolean);
-
-  return passages.join("\n---\n");
-}
 
 /** -----------------------------
  * WebSocket: Twilio ↔ OpenAI Realtime
  * ----------------------------- */
 fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, (connection) => {
-    fastify.log.info("Client connected (Twilio WS)");
-
     let streamSid = null;
     let callSid = null;
 
-    const userTranscriptBufferByItem = new Map();
-    const assistantTranscriptBufferByResp = new Map();
-    const handledToolCalls = new Set();
+    const userTranscriptBufByItem = new Map();
+    const assistantTranscriptBufByResp = new Map();
 
     const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
@@ -288,6 +174,13 @@ fastify.register(async (fastify) => {
     const safeSendOpenAI = (obj) => {
       if (openAiWs.readyState !== WebSocket.OPEN) return false;
       openAiWs.send(JSON.stringify(obj));
+      return true;
+    };
+
+    const safeSendTwilio = (obj) => {
+      const twilioWs = connection.socket || connection;
+      if (!twilioWs || twilioWs.readyState !== WebSocket.OPEN) return false;
+      twilioWs.send(JSON.stringify(obj));
       return true;
     };
 
@@ -307,20 +200,6 @@ fastify.register(async (fastify) => {
           input_audio_transcription: { model: TRANSCRIPTION_MODEL },
 
           prompt: { id: OPENAI_PROMPT_ID },
-
-          tools: [
-            {
-              type: "function",
-              name: "kb_search",
-              description: "Search the CallsAnswered.ai knowledge base and return relevant passages.",
-              parameters: {
-                type: "object",
-                properties: { query: { type: "string" } },
-                required: ["query"],
-              },
-            },
-          ],
-          tool_choice: "auto",
         },
       });
 
@@ -329,12 +208,12 @@ fastify.register(async (fastify) => {
     };
 
     openAiWs.on("open", () => {
-      fastify.log.info("Connected to OpenAI Realtime");
-      // Small delay helps ensure session.update lands before first response
+      // DEBUG LOG #1 (only)
+      fastify.log.debug({ streamSid }, "debug: openai_ws_open");
       setTimeout(initializeSession, 250);
     });
 
-    openAiWs.on("message", async (raw) => {
+    openAiWs.on("message", (raw) => {
       try {
         const evt = JSON.parse(raw);
 
@@ -343,20 +222,11 @@ fastify.register(async (fastify) => {
         // ========================================
         if (evt.type === "response.output_audio.delta") {
           if (streamSid && evt.delta) {
-            try {
-              const twilioWs = connection.socket || connection;
-              if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
-                twilioWs.send(
-                  JSON.stringify({
-                    event: "media",
-                    streamSid,
-                    media: { payload: evt.delta }, // base64 g711_ulaw
-                  })
-                );
-              }
-            } catch (e) {
-              fastify.log.error({ err: String(e), streamSid }, "❌ Failed sending audio to Twilio");
-            }
+            safeSendTwilio({
+              event: "media",
+              streamSid,
+              media: { payload: evt.delta }, // base64 g711_ulaw
+            });
           }
           return;
         }
@@ -364,77 +234,40 @@ fastify.register(async (fastify) => {
         // Caller transcript deltas/completed
         if (evt.type === "conversation.item.input_audio_transcription.delta") {
           const itemId = evt.item_id;
-          const prev = userTranscriptBufferByItem.get(itemId) || "";
-          userTranscriptBufferByItem.set(itemId, prev + (evt.delta || ""));
+          const prev = userTranscriptBufByItem.get(itemId) || "";
+          userTranscriptBufByItem.set(itemId, prev + (evt.delta || ""));
           return;
         }
 
         if (evt.type === "conversation.item.input_audio_transcription.completed") {
           const itemId = evt.item_id;
-          const finalText = (evt.transcript || userTranscriptBufferByItem.get(itemId) || "").trim();
-          userTranscriptBufferByItem.delete(itemId);
+          const finalText = (evt.transcript || userTranscriptBufByItem.get(itemId) || "").trim();
+          userTranscriptBufByItem.delete(itemId);
           if (finalText) addTurn(streamSid, "user", finalText);
           return;
         }
 
-        // Assistant transcript (if enabled by the model/session)
+        // Assistant transcript deltas/done (if provided)
         if (evt.type === "response.output_audio_transcript.delta") {
           const rid = evt.response_id;
-          const prev = assistantTranscriptBufferByResp.get(rid) || "";
-          assistantTranscriptBufferByResp.set(rid, prev + (evt.delta || ""));
+          const prev = assistantTranscriptBufByResp.get(rid) || "";
+          assistantTranscriptBufByResp.set(rid, prev + (evt.delta || ""));
           return;
         }
 
         if (evt.type === "response.output_audio_transcript.done") {
           const rid = evt.response_id;
-          const finalText = (evt.transcript || assistantTranscriptBufferByResp.get(rid) || "").trim();
-          assistantTranscriptBufferByResp.delete(rid);
+          const finalText = (evt.transcript || assistantTranscriptBufByResp.get(rid) || "").trim();
+          assistantTranscriptBufByResp.delete(rid);
           if (finalText) addTurn(streamSid, "assistant", finalText);
           return;
         }
-
-        // Tool call: kb_search
-        if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
-          const fc = evt.item;
-          if (fc.name !== "kb_search" || !fc.call_id) return;
-
-          if (handledToolCalls.has(fc.call_id)) return;
-          handledToolCalls.add(fc.call_id);
-
-          let args = {};
-          try {
-            args = typeof fc.arguments === "string" ? JSON.parse(fc.arguments) : fc.arguments || {};
-          } catch {
-            args = {};
-          }
-
-          const query = String(args?.query || "").trim() || "callsanswered";
-
-          let passages = "";
-          try {
-            const vsJson = await vectorStoreSearch(query);
-            passages = extractPassages(vsJson);
-          } catch (e) {
-            fastify.log.error({ err: String(e), streamSid }, "KB search failed");
-          }
-
-          safeSendOpenAI({
-            type: "conversation.item.create",
-            item: {
-              type: "function_call_output",
-              call_id: fc.call_id,
-              output: JSON.stringify({ query, passages }),
-            },
-          });
-
-          safeSendOpenAI({ type: "response.create" });
-        }
-      } catch (e) {
-        fastify.log.error({ err: String(e) }, "Error processing OpenAI event");
+      } catch {
+        // keep quiet; no extra logs
       }
     });
 
-    connection.on("message", (msg) => {
+    const onTwilioMessage = (msg) => {
       try {
         const data = JSON.parse(msg);
 
@@ -442,38 +275,46 @@ fastify.register(async (fastify) => {
           streamSid = data.start.streamSid;
           callSid = data.start.callSid || null;
 
-          const rec = getOrCreateTranscript(streamSid);
-          if (rec) rec.callSid = callSid;
+          const st = getOrCreateState(streamSid);
+          if (st) st.callSid = callSid;
 
-          fastify.log.info({ streamSid, callSid }, "Incoming stream started");
+          // DEBUG LOG #2 (only)
+          fastify.log.debug({ streamSid, callSid }, "debug: twilio_stream_started");
           return;
         }
 
         if (data.event === "media") {
-          if (openAiWs.readyState === WebSocket.OPEN) {
-            safeSendOpenAI({ type: "input_audio_buffer.append", audio: data.media.payload });
-          }
+          safeSendOpenAI({ type: "input_audio_buffer.append", audio: data.media.payload });
           return;
         }
 
         if (data.event === "stop") {
-          fastify.log.info({ streamSid }, "Received stop event from Twilio.");
-          finalizeCallIfPossible(streamSid, callSid);
+          finalizeCall(streamSid);
           return;
         }
-      } catch (e) {
-        fastify.log.error({ err: String(e) }, "Error parsing Twilio message");
+      } catch {
+        // no extra logs
       }
-    });
+    };
 
-    connection.on("close", () => {
-      fastify.log.info({ streamSid }, "Client disconnected (Twilio WS).");
-      finalizeCallIfPossible(streamSid, callSid);
-
-      try {
-        if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-      } catch {}
-    });
+    // fastify-ws gives either a WebSocket-like object or wraps it; handle both.
+    if (typeof connection.on === "function") {
+      connection.on("message", onTwilioMessage);
+      connection.on("close", () => {
+        finalizeCall(streamSid);
+        try {
+          if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+        } catch {}
+      });
+    } else if (connection.socket && typeof connection.socket.on === "function") {
+      connection.socket.on("message", onTwilioMessage);
+      connection.socket.on("close", () => {
+        finalizeCall(streamSid);
+        try {
+          if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+        } catch {}
+      });
+    }
   });
 });
 
@@ -485,5 +326,4 @@ fastify.listen({ port: LISTEN_PORT, host: "0.0.0.0" }, (err) => {
     fastify.log.error(err);
     process.exit(1);
   }
-  fastify.log.info(`Server is listening on port ${LISTEN_PORT}`);
 });
