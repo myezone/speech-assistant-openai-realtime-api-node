@@ -2,7 +2,11 @@
  * index.js — Twilio Media Streams ↔ OpenAI Realtime
  * + Postgres logging (calls + call_utterances)
  *
- * FIXED: Removed duplicate audio handlers that caused crackling noise
+ * Recommended fixes applied:
+ * - Removed duplicate OpenAI audio delta handlers (prevents crackling + double-send)
+ * - Removed illegal top-level `return;` patterns
+ * - Cleaned up session.update to the current Realtime shape for Twilio (g711_ulaw, server_vad, transcription)
+ * - Kept a single, safe Twilio send path (checks WS readyState)
  */
 
 import Fastify from "fastify";
@@ -46,6 +50,41 @@ const DEFAULT_VOICE = VOICE || "marin";
 const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
 const RETAIN_MAX = Math.max(1, Math.min(500, Number(MAX_TRANSCRIPTS) || 50));
 
+/** -----------------------------
+ * In-memory transcript store
+ * ----------------------------- */
+const transcriptsByStreamSid = new Map(); // streamSid -> record
+const transcriptOrder = []; // oldest -> newest
+let latestStreamSid = null;
+
+function retainIfNeeded() {
+  while (transcriptOrder.length > RETAIN_MAX) {
+    const sid = transcriptOrder.shift();
+    if (sid) transcriptsByStreamSid.delete(sid);
+  }
+}
+
+function getOrCreateTranscript(streamSid) {
+  if (!streamSid) return null;
+  let rec = transcriptsByStreamSid.get(streamSid);
+  if (!rec) {
+    rec = {
+      streamSid,
+      callSid: null, // Twilio CallSid (CA...)
+      startedAt: Date.now(),
+      endedAt: null,
+      durationMs: null,
+      turns: [], // { role: 'user'|'assistant', text, ts }
+      summarySaved: false,
+    };
+    transcriptsByStreamSid.set(streamSid, rec);
+    transcriptOrder.push(streamSid);
+    latestStreamSid = streamSid;
+    retainIfNeeded();
+  }
+  return rec;
+}
+
 /** DB write for each turn (non-blocking) */
 function persistTurn(rec, role, text) {
   const callSid = rec?.callSid;
@@ -83,7 +122,6 @@ function addTurn(streamSid, role, text) {
   if (role === "user") fastify.log.info({ streamSid, user: clean }, "USER TRANSCRIPT");
   if (role === "assistant") fastify.log.info({ streamSid, assistant: clean }, "ASSISTANT TRANSCRIPT");
 
-  // write to DB
   persistTurn(rec, role, clean);
 }
 
@@ -106,7 +144,6 @@ function finalizeCallIfPossible(streamSid, fallbackCallSid = null) {
   const turns = rec.turns?.length || 0;
   const durationSeconds = Math.max(0, Math.round((rec.durationMs || 0) / 1000));
 
-  // simple summary text
   const firstUser = rec.turns.find((t) => t.role === "user")?.text || "";
   const lastAgent = [...rec.turns].reverse().find((t) => t.role === "assistant")?.text || "";
   const summaryText =
@@ -125,41 +162,6 @@ function finalizeCallIfPossible(streamSid, fallbackCallSid = null) {
   }).catch((e) => {
     fastify.log.error({ callSid, err: String(e) }, "saveCallSummary failed");
   });
-}
-
-/** -----------------------------
- * In-memory transcript store
- * ----------------------------- */
-const transcriptsByStreamSid = new Map(); // streamSid -> record
-const transcriptOrder = []; // oldest -> newest
-let latestStreamSid = null;
-
-function retainIfNeeded() {
-  while (transcriptOrder.length > RETAIN_MAX) {
-    const sid = transcriptOrder.shift();
-    if (sid) transcriptsByStreamSid.delete(sid);
-  }
-}
-
-function getOrCreateTranscript(streamSid) {
-  if (!streamSid) return null;
-  let rec = transcriptsByStreamSid.get(streamSid);
-  if (!rec) {
-    rec = {
-      streamSid,
-      callSid: null, // Twilio CallSid (CA...)
-      startedAt: Date.now(),
-      endedAt: null,
-      durationMs: null,
-      turns: [], // { role: 'user'|'assistant', text, ts }
-      summarySaved: false,
-    };
-    transcriptsByStreamSid.set(streamSid, rec);
-    transcriptOrder.push(streamSid);
-    latestStreamSid = streamSid;
-    retainIfNeeded();
-  }
-  return rec;
 }
 
 /** -----------------------------
@@ -205,7 +207,7 @@ fastify.all("/incoming-call", async (request, reply) => {
 });
 
 /** -----------------------------
- * Twilio status callback (optional but good)
+ * Twilio status callback
  * ----------------------------- */
 fastify.post("/twilio/call-status", async (req, reply) => {
   try {
@@ -297,14 +299,13 @@ fastify.register(async (fastify) => {
           modalities: ["audio"],
           voice: DEFAULT_VOICE,
 
-          // ✅ Important for Twilio Media Streams (8kHz µ-law)
+          // Twilio Media Streams audio format (8kHz µ-law)
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
 
           turn_detection: { type: "server_vad" },
           input_audio_transcription: { model: TRANSCRIPTION_MODEL },
 
-          // keep your prompt id if you want
           prompt: { id: OPENAI_PROMPT_ID },
 
           tools: [
@@ -323,12 +324,13 @@ fastify.register(async (fastify) => {
         },
       });
 
+      // greet
       safeSendOpenAI({ type: "response.create" });
     };
 
     openAiWs.on("open", () => {
       fastify.log.info("Connected to OpenAI Realtime");
-      // Increased timeout for better initialization (was 50ms)
+      // Small delay helps ensure session.update lands before first response
       setTimeout(initializeSession, 250);
     });
 
@@ -337,20 +339,18 @@ fastify.register(async (fastify) => {
         const evt = JSON.parse(raw);
 
         // ========================================
-        // FIXED: Single audio handler (no duplicates)
+        // Single audio handler (NO DUPLICATES)
         // ========================================
         if (evt.type === "response.output_audio.delta") {
           if (streamSid && evt.delta) {
             try {
               const twilioWs = connection.socket || connection;
-
-              // Verify WebSocket is ready before sending
               if (twilioWs && twilioWs.readyState === WebSocket.OPEN) {
                 twilioWs.send(
                   JSON.stringify({
                     event: "media",
                     streamSid,
-                    media: { payload: evt.delta },
+                    media: { payload: evt.delta }, // base64 g711_ulaw
                   })
                 );
               }
@@ -358,7 +358,7 @@ fastify.register(async (fastify) => {
               fastify.log.error({ err: String(e), streamSid }, "❌ Failed sending audio to Twilio");
             }
           }
-          return; // Important: exit handler after processing
+          return;
         }
 
         // Caller transcript deltas/completed
@@ -377,7 +377,7 @@ fastify.register(async (fastify) => {
           return;
         }
 
-        // Assistant transcript
+        // Assistant transcript (if enabled by the model/session)
         if (evt.type === "response.output_audio_transcript.delta") {
           const rid = evt.response_id;
           const prev = assistantTranscriptBufferByResp.get(rid) || "";
@@ -469,6 +469,7 @@ fastify.register(async (fastify) => {
     connection.on("close", () => {
       fastify.log.info({ streamSid }, "Client disconnected (Twilio WS).");
       finalizeCallIfPossible(streamSid, callSid);
+
       try {
         if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
       } catch {}
