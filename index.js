@@ -159,16 +159,38 @@ fastify.post("/twilio/call-status", async (req, reply) => {
 /** -----------------------------
  * WebSocket: Twilio ↔ OpenAI Realtime
  * ----------------------------- */
-fastify.register(async (fastify) => {
-  fastify.get("/media-stream", { websocket: true }, (connection) => {
+fastify.register(async (fastify) => {fastify.register(async (fastify) => {
+  fastify.get("/media-stream", { websocket: true }, (connection, req) => {
+    // IMPORTANT: always use the underlying socket
+    const twilioWs = connection.socket;
+
+    fastify.log.info(
+      {
+        upgrade: req.headers.upgrade,
+        connection: req.headers.connection,
+        secWebSocketKey: req.headers["sec-websocket-key"] ? "present" : "missing",
+        url: req.url,
+      },
+      "✅ Twilio WS route entered"
+    );
+
     let streamSid = null;
     let callSid = null;
 
-    const userTranscriptBufByItem = new Map();
-    const assistantTranscriptBufByResp = new Map();
+    const userTranscriptBufferByItem = new Map();
+    const assistantTranscriptBufferByResp = new Map();
+    const handledToolCalls = new Set();
 
     const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    });
+
+    openAiWs.on("error", (err) => {
+      fastify.log.error({ err: String(err) }, "❌ OpenAI WS error");
+    });
+
+    openAiWs.on("close", (code, reason) => {
+      fastify.log.warn({ code, reason: reason?.toString?.() }, "⚠️ OpenAI WS closed");
     });
 
     const safeSendOpenAI = (obj) => {
@@ -177,13 +199,6 @@ fastify.register(async (fastify) => {
       return true;
     };
 
-    const safeSendTwilio = (obj) => {
-      const twilioWs = connection.socket || connection;
-      if (!twilioWs || twilioWs.readyState !== WebSocket.OPEN) return false;
-      twilioWs.send(JSON.stringify(obj));
-      return true;
-    };
-   
     const initializeSession = () => {
       safeSendOpenAI({
         type: "session.update",
@@ -191,175 +206,100 @@ fastify.register(async (fastify) => {
           model: REALTIME_MODEL,
           modalities: ["audio"],
           voice: DEFAULT_VOICE,
-          // Twilio Media Streams audio format (8kHz µ-law)
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           turn_detection: { type: "server_vad" },
           input_audio_transcription: { model: TRANSCRIPTION_MODEL },
           prompt: { id: OPENAI_PROMPT_ID },
+          tools: [
+            {
+              type: "function",
+              name: "kb_search",
+              description: "Search the CallsAnswered.ai knowledge base and return relevant passages.",
+              parameters: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+              },
+            },
+          ],
+          tool_choice: "auto",
         },
       });
 
-      // greet
       safeSendOpenAI({ type: "response.create" });
     };
 
     openAiWs.on("open", () => {
-      // DEBUG LOG #1 (only)
-      fastify.log.debug({ streamSid }, "debug: openai_ws_open");
+      fastify.log.info("✅ Connected to OpenAI Realtime");
       setTimeout(initializeSession, 250);
     });
 
-openAiWs.on("message", async (raw) => {
-  try {
-    const evt = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
-
-    // ========================================
-    // Single audio handler (NO DUPLICATES)
-    // ========================================
-    if (evt.type === "response.output_audio.delta") {
-      if (streamSid && evt.delta) {
-        safeSendTwilio({
-          event: "media",
-          streamSid,
-          media: { payload: evt.delta }, // base64 g711_ulaw
-        });
-      }
-      return;
-    }
-
-    // ========================================
-    // Caller transcript deltas/completed
-    // ========================================
-    if (evt.type === "conversation.item.input_audio_transcription.delta") {
-      const itemId = evt.item_id;
-      const prev = userTranscriptBufByItem.get(itemId) || "";
-      userTranscriptBufByItem.set(itemId, prev + (evt.delta || ""));
-      return;
-    }
-
-    if (evt.type === "conversation.item.input_audio_transcription.completed") {
-      const itemId = evt.item_id;
-      const finalText = (evt.transcript || userTranscriptBufByItem.get(itemId) || "").trim();
-      userTranscriptBufByItem.delete(itemId);
-      if (finalText) addTurn(streamSid, "user", finalText);
-      return;
-    }
-
-    // ========================================
-    // Assistant transcript deltas/done (if provided)
-    // ========================================
-    if (evt.type === "response.output_audio_transcript.delta") {
-      const rid = evt.response_id;
-      const prev = assistantTranscriptBufByResp.get(rid) || "";
-      assistantTranscriptBufByResp.set(rid, prev + (evt.delta || ""));
-      return;
-    }
-
-    if (evt.type === "response.output_audio_transcript.done") {
-      const rid = evt.response_id;
-      const finalText = (evt.transcript || assistantTranscriptBufByResp.get(rid) || "").trim();
-      assistantTranscriptBufByResp.delete(rid);
-      if (finalText) addTurn(streamSid, "assistant", finalText);
-      return;
-    }
-
-    // ========================================
-    // Tool call: kb_search (vector store)
-    // ========================================
-    if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
-      const fc = evt.item;
-
-      if (fc.name !== "kb_search" || !fc.call_id) return;
-      if (handledToolCalls.has(fc.call_id)) return;
-      handledToolCalls.add(fc.call_id);
-
-      let args = {};
+    openAiWs.on("message", async (raw) => {
+      let evt;
       try {
-        args = typeof fc.arguments === "string" ? JSON.parse(fc.arguments) : fc.arguments || {};
-      } catch {
-        args = {};
+        evt = JSON.parse(raw);
+      } catch (e) {
+        fastify.log.error({ err: String(e) }, "OpenAI JSON parse error");
+        return;
       }
 
-      const query = String(args?.query || "").trim() || "callsanswered";
-
-      let passages = "";
-      try {
-        const vsJson = await vectorStoreSearch(query);
-        passages = extractPassages(vsJson);
-      } catch {
-        passages = "";
-      }
-
-      safeSendOpenAI({
-        type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: fc.call_id,
-          output: JSON.stringify({ query, passages }),
-        },
-      });
-
-      // Ask the model to continue now that tool output is provided
-      safeSendOpenAI({ type: "response.create" });
-      return;
-    }
-  } catch {
-    // keep quiet; no extra logs
-  }
-});
-
-    
-    const onTwilioMessage = (msg) => {
-      try {
-        const data = JSON.parse(msg);
-
-        if (data.event === "start") {
-          streamSid = data.start.streamSid;
-          callSid = data.start.callSid || null;
-
-          const st = getOrCreateState(streamSid);
-          if (st) st.callSid = callSid;
-
-          // DEBUG LOG #2 (only)
-          fastify.log.debug({ streamSid, callSid }, "debug: twilio_stream_started");
-          return;
+      if (evt.type === "response.output_audio.delta") {
+        if (streamSid && evt.delta && twilioWs.readyState === WebSocket.OPEN) {
+          twilioWs.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: evt.delta },
+            })
+          );
         }
+        return;
+      }
 
-        if (data.event === "media") {
+      // (keep the rest of your transcript + tool-call handling here)
+    });
+
+    twilioWs.on("message", (msg) => {
+      let data;
+      try {
+        data = JSON.parse(msg);
+      } catch (e) {
+        fastify.log.error({ err: String(e) }, "Twilio JSON parse error");
+        return;
+      }
+
+      if (data.event === "start") {
+        streamSid = data.start.streamSid;
+        callSid = data.start.callSid || null;
+        fastify.log.info({ streamSid, callSid }, "✅ Incoming stream started");
+        return;
+      }
+
+      if (data.event === "media") {
+        if (openAiWs.readyState === WebSocket.OPEN) {
           safeSendOpenAI({ type: "input_audio_buffer.append", audio: data.media.payload });
-          return;
         }
-
-        if (data.event === "stop") {
-          finalizeCall(streamSid);
-          return;
-        }
-      } catch {
-        // no extra logs
+        return;
       }
-    };
 
-    // fastify-ws gives either a WebSocket-like object or wraps it; handle both.
-    if (typeof connection.on === "function") {
-      connection.on("message", onTwilioMessage);
-      connection.on("close", () => {
-        finalizeCall(streamSid);
-        try {
-          if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-        } catch {}
-      });
-    } else if (connection.socket && typeof connection.socket.on === "function") {
-      connection.socket.on("message", onTwilioMessage);
-      connection.socket.on("close", () => {
-        finalizeCall(streamSid);
-        try {
-          if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-        } catch {}
-      });
-    }
+      if (data.event === "stop") {
+        fastify.log.info({ streamSid }, "🛑 Received stop event from Twilio");
+        finalizeCallIfPossible(streamSid, callSid);
+        return;
+      }
+    });
+
+    twilioWs.on("close", () => {
+      fastify.log.info({ streamSid }, "👋 Twilio WS closed");
+      finalizeCallIfPossible(streamSid, callSid);
+      try {
+        if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+      } catch {}
+    });
   });
 });
+
 
 /** -----------------------------
  * Start server
