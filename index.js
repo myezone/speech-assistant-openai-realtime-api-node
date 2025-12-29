@@ -291,41 +291,43 @@ fastify.register(async (fastify) => {
       return true;
     };
 
-    const initializeSession = () => {
-      safeSendOpenAI({
-        type: "session.update",
-        session: {
-          type: "realtime",
-          model: REALTIME_MODEL,
-          output_modalities: ["audio"],
-          audio: {
-            input: {
-              format: { type: "g711_ulaw" },
-              turn_detection: { type: "server_vad" },
-              transcription: { model: TRANSCRIPTION_MODEL },
-            },
-            output: { format: { type: "g711_ulaw" }, voice: DEFAULT_VOICE },
-          },
-          prompt: { id: OPENAI_PROMPT_ID },
-          tools: [
-            {
-              type: "function",
-              name: "kb_search",
-              description: "Search the CallsAnswered.ai knowledge base and return relevant passages.",
-              parameters: {
-                type: "object",
-                properties: { query: { type: "string" } },
-                required: ["query"],
-              },
-            },
-          ],
-          tool_choice: "auto",
-        },
-      });
+const initializeSession = () => {
+  safeSendOpenAI({
+    type: "session.update",
+    session: {
+      model: REALTIME_MODEL,
+      modalities: ["audio"],
+      voice: DEFAULT_VOICE,
 
-      // greet
-      safeSendOpenAI({ type: "response.create" });
-    };
+      // ✅ Important for Twilio Media Streams (8kHz µ-law)
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+
+      turn_detection: { type: "server_vad" },
+      input_audio_transcription: { model: TRANSCRIPTION_MODEL },
+
+      // keep your prompt id if you want
+      prompt: { id: OPENAI_PROMPT_ID },
+
+      tools: [
+        {
+          type: "function",
+          name: "kb_search",
+          description: "Search the CallsAnswered.ai knowledge base and return relevant passages.",
+          parameters: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
+        },
+      ],
+      tool_choice: "auto",
+    },
+  });
+
+  safeSendOpenAI({ type: "response.create" });
+};
+
 
     openAiWs.on("open", () => {
       fastify.log.info("Connected to OpenAI Realtime");
