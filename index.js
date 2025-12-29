@@ -162,31 +162,6 @@ function getOrCreateTranscript(streamSid) {
   return rec;
 }
 
-// --- OpenAI -> Twilio audio ---
-if (evt.type === "response.output_audio.delta") {
-  // OpenAI sends base64 audio in evt.delta (g711_ulaw per your session config)
-  if (streamSid) {
-    const payload = evt.delta; // already base64
-    try {
-      // fastify websocket plugin sometimes provides connection.socket; be safe:
-      const twilioWs = connection.socket || connection;
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload },
-        })
-      );
-    } catch (e) {
-      fastify.log.error({ err: String(e), streamSid }, "Failed sending audio to Twilio");
-    }
-  }
-  return;}
-if (evt.type === "response.output_audio.delta") {
-  fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "OPENAI AUDIO DELTA");
-  ...
-}
-
 /** -----------------------------
  * Basic routes
  * ----------------------------- */
@@ -359,6 +334,30 @@ fastify.register(async (fastify) => {
       try {
         const evt = JSON.parse(raw);
 
+        // --- OpenAI -> Twilio audio ---
+          if (evt.type === "response.output_audio.delta") {
+            // OpenAI sends base64 audio in evt.delta (g711_ulaw per your session config)
+            if (streamSid) {
+              const payload = evt.delta; // already base64
+              try {
+                // fastify websocket plugin sometimes provides connection.socket; be safe:
+                const twilioWs = connection.socket || connection;
+                twilioWs.send(
+                  JSON.stringify({
+                    event: "media",
+                    streamSid,
+                    media: { payload },
+                  })
+                );
+              } catch (e) {
+                fastify.log.error({ err: String(e), streamSid }, "Failed sending audio to Twilio");
+              }
+            }
+            return;}
+          if (evt.type === "response.output_audio.delta") {
+            fastify.log.info({ streamSid, bytes: evt.delta?.length || 0 }, "OPENAI AUDIO DELTA");
+            ...
+          }
         // Caller transcript deltas/completed
         if (evt.type === "conversation.item.input_audio_transcription.delta") {
           const itemId = evt.item_id;
