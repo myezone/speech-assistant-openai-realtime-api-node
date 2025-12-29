@@ -210,60 +210,106 @@ fastify.register(async (fastify) => {
       setTimeout(initializeSession, 250);
     });
 
-    openAiWs.on("message", (raw) => {
-      try {
-        const evt = JSON.parse(raw);
+openAiWs.on("message", async (raw) => {
+  try {
+    const evt = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf8"));
 
-        // ========================================
-        // Single audio handler (NO DUPLICATES)
-        // ========================================
-        if (evt.type === "response.output_audio.delta") {
-          if (streamSid && evt.delta) {
-            safeSendTwilio({
-              event: "media",
-              streamSid,
-              media: { payload: evt.delta }, // base64 g711_ulaw
-            });
-          }
-          return;
-        }
-
-        // Caller transcript deltas/completed
-        if (evt.type === "conversation.item.input_audio_transcription.delta") {
-          const itemId = evt.item_id;
-          const prev = userTranscriptBufByItem.get(itemId) || "";
-          userTranscriptBufByItem.set(itemId, prev + (evt.delta || ""));
-          return;
-        }
-
-        if (evt.type === "conversation.item.input_audio_transcription.completed") {
-          const itemId = evt.item_id;
-          const finalText = (evt.transcript || userTranscriptBufByItem.get(itemId) || "").trim();
-          userTranscriptBufByItem.delete(itemId);
-          if (finalText) addTurn(streamSid, "user", finalText);
-          return;
-        }
-
-        // Assistant transcript deltas/done (if provided)
-        if (evt.type === "response.output_audio_transcript.delta") {
-          const rid = evt.response_id;
-          const prev = assistantTranscriptBufByResp.get(rid) || "";
-          assistantTranscriptBufByResp.set(rid, prev + (evt.delta || ""));
-          return;
-        }
-
-        if (evt.type === "response.output_audio_transcript.done") {
-          const rid = evt.response_id;
-          const finalText = (evt.transcript || assistantTranscriptBufByResp.get(rid) || "").trim();
-          assistantTranscriptBufByResp.delete(rid);
-          if (finalText) addTurn(streamSid, "assistant", finalText);
-          return;
-        }
-      } catch {
-        // keep quiet; no extra logs
+    // ========================================
+    // Single audio handler (NO DUPLICATES)
+    // ========================================
+    if (evt.type === "response.output_audio.delta") {
+      if (streamSid && evt.delta) {
+        safeSendTwilio({
+          event: "media",
+          streamSid,
+          media: { payload: evt.delta }, // base64 g711_ulaw
+        });
       }
-    });
+      return;
+    }
 
+    // ========================================
+    // Caller transcript deltas/completed
+    // ========================================
+    if (evt.type === "conversation.item.input_audio_transcription.delta") {
+      const itemId = evt.item_id;
+      const prev = userTranscriptBufByItem.get(itemId) || "";
+      userTranscriptBufByItem.set(itemId, prev + (evt.delta || ""));
+      return;
+    }
+
+    if (evt.type === "conversation.item.input_audio_transcription.completed") {
+      const itemId = evt.item_id;
+      const finalText = (evt.transcript || userTranscriptBufByItem.get(itemId) || "").trim();
+      userTranscriptBufByItem.delete(itemId);
+      if (finalText) addTurn(streamSid, "user", finalText);
+      return;
+    }
+
+    // ========================================
+    // Assistant transcript deltas/done (if provided)
+    // ========================================
+    if (evt.type === "response.output_audio_transcript.delta") {
+      const rid = evt.response_id;
+      const prev = assistantTranscriptBufByResp.get(rid) || "";
+      assistantTranscriptBufByResp.set(rid, prev + (evt.delta || ""));
+      return;
+    }
+
+    if (evt.type === "response.output_audio_transcript.done") {
+      const rid = evt.response_id;
+      const finalText = (evt.transcript || assistantTranscriptBufByResp.get(rid) || "").trim();
+      assistantTranscriptBufByResp.delete(rid);
+      if (finalText) addTurn(streamSid, "assistant", finalText);
+      return;
+    }
+
+    // ========================================
+    // Tool call: kb_search (vector store)
+    // ========================================
+    if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
+      const fc = evt.item;
+
+      if (fc.name !== "kb_search" || !fc.call_id) return;
+      if (handledToolCalls.has(fc.call_id)) return;
+      handledToolCalls.add(fc.call_id);
+
+      let args = {};
+      try {
+        args = typeof fc.arguments === "string" ? JSON.parse(fc.arguments) : fc.arguments || {};
+      } catch {
+        args = {};
+      }
+
+      const query = String(args?.query || "").trim() || "callsanswered";
+
+      let passages = "";
+      try {
+        const vsJson = await vectorStoreSearch(query);
+        passages = extractPassages(vsJson);
+      } catch {
+        passages = "";
+      }
+
+      safeSendOpenAI({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: fc.call_id,
+          output: JSON.stringify({ query, passages }),
+        },
+      });
+
+      // Ask the model to continue now that tool output is provided
+      safeSendOpenAI({ type: "response.create" });
+      return;
+    }
+  } catch {
+    // keep quiet; no extra logs
+  }
+});
+
+    
     const onTwilioMessage = (msg) => {
       try {
         const data = JSON.parse(msg);
