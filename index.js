@@ -1,13 +1,6 @@
 /**
- * index.js — Twilio Media Streams ↔ OpenAI Realtime (minimal)
- *
- * Included recommendations only:
- * - Single OpenAI audio delta handler (no duplicates)
- * - No illegal top-level `return;`
- * - session.update shaped for Twilio (g711_ulaw, server_vad, transcription)
- * - Single safe Twilio send path (checks WS readyState)
- *
- * Plus: exactly TWO debug logs.
+ * index.js — Twilio Media Streams ↔ OpenAI Realtime
+ * With call transfer functionality to +14026171324
  */
 
 import Fastify from "fastify";
@@ -15,6 +8,7 @@ import WebSocket from "ws";
 import dotenv from "dotenv";
 import fastifyFormBody from "@fastify/formbody";
 import fastifyWs from "@fastify/websocket";
+import twilio from "twilio";
 
 import {
   upsertCallStart,
@@ -33,14 +27,20 @@ const {
   VOICE,
   OPENAI_TRANSCRIPTION_MODEL,
   PUBLIC_HOST,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
 } = process.env;
 
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 if (!OPENAI_PROMPT_ID) throw new Error("Missing OPENAI_PROMPT_ID");
+if (!TWILIO_ACCOUNT_SID) throw new Error("Missing TWILIO_ACCOUNT_SID");
+if (!TWILIO_AUTH_TOKEN) throw new Error("Missing TWILIO_AUTH_TOKEN");
+
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const fastify = Fastify({
   logger: {
-    level: process.env.LOG_LEVEL || "info", // set to "debug" to see the 2 debug logs
+    level: process.env.LOG_LEVEL || "info",
   },
 });
 
@@ -51,9 +51,84 @@ const LISTEN_PORT = Number(PORT) || 10000;
 const REALTIME_MODEL = "gpt-realtime";
 const DEFAULT_VOICE = VOICE || "marin";
 const TRANSCRIPTION_MODEL = OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
+const TRANSFER_NUMBER = "+14026171324";
 
-/** --------- Minimal transcript aggregation (per callSid) --------- */
-const callStateByStreamSid = new Map(); // streamSid -> { callSid, startedAt, turns: [{role,text,ts}] }
+/** --------- Helper Functions --------- */
+
+/**
+ * Handle call transfer by updating the active call with new TwiML
+ */
+async function handleCallTransfer(callSid, reason) {
+  if (!callSid) {
+    console.error("❌ Cannot transfer: callSid is null");
+    return;
+  }
+
+  try {
+    console.log(`📞 Transferring call ${callSid}. Reason: ${reason}`);
+
+    await twilioClient.calls(callSid).update({
+      twiml: `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">One moment please, I'm connecting you now.</Say>
+  <Dial timeout="30" action="https://${PUBLIC_HOST}/call-transfer-status">
+    <Number>${TRANSFER_NUMBER}</Number>
+  </Dial>
+  <Say voice="Polly.Joanna">
+    I'm sorry, no one is available to take your call right now. 
+    Please leave a message after the tone.
+  </Say>
+</Response>`
+    });
+
+    console.log(`✅ Transfer initiated for call ${callSid} to ${TRANSFER_NUMBER}`);
+  } catch (error) {
+    console.error(`❌ Transfer failed for call ${callSid}:`, error.message);
+  }
+}
+
+/**
+ * Handle knowledge base search
+ */
+async function handleKbSearch(query) {
+  try {
+    fastify.log.info({ query }, "🔍 KB Search requested");
+    
+    // TODO: Replace with your actual KB search logic
+    // For now, returning a placeholder response
+    return {
+      success: true,
+      results: [
+        {
+          content: "This is a placeholder KB response. Connect your actual knowledge base here.",
+          relevance: 0.9
+        }
+      ]
+    };
+  } catch (error) {
+    fastify.log.error({ error: error.message }, "❌ KB Search error");
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Finalize call state and cleanup
+ */
+function finalizeCallIfPossible(streamSid, callSid) {
+  if (streamSid) {
+    const st = getOrCreateState(streamSid);
+    if (st && callSid) {
+      st.callSid = callSid;
+    }
+    finalizeCall(streamSid);
+  }
+}
+
+/** --------- Transcript aggregation (per callSid) --------- */
+const callStateByStreamSid = new Map();
 
 function getOrCreateState(streamSid) {
   if (!streamSid) return null;
@@ -104,20 +179,18 @@ function finalizeCall(streamSid) {
 }
 
 /** -----------------------------
- * Basic routes
+ * Routes
  * ----------------------------- */
+
 fastify.get("/", async (_req, reply) => reply.send({ ok: true }));
 
-/** -----------------------------
- * Twilio webhook: incoming call -> TwiML Stream
- * ----------------------------- */
+/** Twilio webhook: incoming call -> TwiML Stream */
 fastify.all("/incoming-call", async (request, reply) => {
   const callId = request.body?.CallSid || request.query?.CallSid || null;
   const from = request.body?.From || request.query?.From || null;
   const to = request.body?.To || request.query?.To || null;
 
   if (callId) {
-    // keep DB write, but no extra logging
     try {
       await upsertCallStart({ callId, from, to });
     } catch {}
@@ -135,9 +208,7 @@ fastify.all("/incoming-call", async (request, reply) => {
   reply.code(200).type("text/xml").send(twiml);
 });
 
-/** -----------------------------
- * Twilio status callback
- * ----------------------------- */
+/** Twilio status callback */
 fastify.post("/twilio/call-status", async (req, reply) => {
   try {
     const callId = req.body?.CallSid;
@@ -156,12 +227,37 @@ fastify.post("/twilio/call-status", async (req, reply) => {
   return reply.code(200).send("ok");
 });
 
+/** Call transfer status callback */
+fastify.post("/call-transfer-status", async (req, reply) => {
+  try {
+    const callSid = req.body?.CallSid;
+    const dialCallStatus = req.body?.DialCallStatus;
+    const dialCallDuration = req.body?.DialCallDuration;
+
+    fastify.log.info(
+      { callSid, dialCallStatus, dialCallDuration },
+      "📞 Transfer status update"
+    );
+
+    if (dialCallStatus === "completed") {
+      fastify.log.info({ callSid, duration: dialCallDuration }, "✅ Transfer successful - call answered");
+    } else if (dialCallStatus === "no-answer" || dialCallStatus === "busy") {
+      fastify.log.info({ callSid }, "⚠️ Transfer failed - going to voicemail");
+    } else if (dialCallStatus === "failed") {
+      fastify.log.error({ callSid }, "❌ Transfer failed");
+    }
+  } catch (error) {
+    fastify.log.error({ error: error.message }, "❌ Error in transfer status callback");
+  }
+
+  return reply.code(200).send("ok");
+});
+
 /** -----------------------------
  * WebSocket: Twilio ↔ OpenAI Realtime
  * ----------------------------- */
-fastify.register(async (fastify) => {fastify.register(async (fastify) => {
+fastify.register(async (fastify) => {
   fastify.get("/media-stream", { websocket: true }, (connection, req) => {
-    // IMPORTANT: always use the underlying socket
     const twilioWs = connection.socket;
 
     fastify.log.info(
@@ -222,6 +318,21 @@ fastify.register(async (fastify) => {fastify.register(async (fastify) => {
                 required: ["query"],
               },
             },
+            {
+              type: "function",
+              name: "transfer_to_human",
+              description: "Transfer the call to a human representative when the caller requests to speak with someone or needs human assistance.",
+              parameters: {
+                type: "object",
+                properties: {
+                  reason: {
+                    type: "string",
+                    description: "Brief reason why the caller wants to be transferred"
+                  }
+                },
+                required: ["reason"],
+              },
+            },
           ],
           tool_choice: "auto",
         },
@@ -244,6 +355,7 @@ fastify.register(async (fastify) => {fastify.register(async (fastify) => {
         return;
       }
 
+      // Handle audio output
       if (evt.type === "response.output_audio.delta") {
         if (streamSid && evt.delta && twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(
@@ -257,7 +369,96 @@ fastify.register(async (fastify) => {fastify.register(async (fastify) => {
         return;
       }
 
-      // (keep the rest of your transcript + tool-call handling here)
+      // Handle user transcription completion
+      if (evt.type === "conversation.item.input_audio_transcription.completed") {
+        const itemId = evt.item_id;
+        const transcript = evt.transcript || "";
+        userTranscriptBufferByItem.set(itemId, transcript);
+        addTurn(streamSid, "user", transcript);
+        return;
+      }
+
+      // Handle assistant transcription (streaming)
+      if (evt.type === "response.audio_transcript.delta") {
+        const respId = evt.response_id;
+        const delta = evt.delta || "";
+        const existing = assistantTranscriptBufferByResp.get(respId) || "";
+        assistantTranscriptBufferByResp.set(respId, existing + delta);
+        return;
+      }
+
+      // Handle assistant transcription completion
+      if (evt.type === "response.audio_transcript.done") {
+        const respId = evt.response_id;
+        const full = assistantTranscriptBufferByResp.get(respId) || "";
+        if (full) {
+          addTurn(streamSid, "assistant", full);
+          assistantTranscriptBufferByResp.delete(respId);
+        }
+        return;
+      }
+
+      // Handle function calls
+      if (evt.type === "response.function_call_arguments.done") {
+        const callId = evt.call_id;
+        const functionName = evt.name;
+        
+        // Prevent duplicate handling
+        if (handledToolCalls.has(callId)) return;
+        handledToolCalls.add(callId);
+
+        let args;
+        try {
+          args = JSON.parse(evt.arguments);
+        } catch {
+          args = {};
+        }
+
+        fastify.log.info({ functionName, args, callId }, "🔧 Function call received");
+
+        // Handle kb_search
+        if (functionName === "kb_search") {
+          const result = await handleKbSearch(args.query);
+          safeSendOpenAI({
+            type: "conversation.item.create",
+            item: {
+              type: "function_call_output",
+              call_id: callId,
+              output: JSON.stringify(result),
+            },
+          });
+          safeSendOpenAI({ type: "response.create" });
+          return;
+        }
+
+        // Handle transfer_to_human
+        if (functionName === "transfer_to_human") {
+          fastify.log.info({ callSid, reason: args.reason }, "📞 Initiating call transfer");
+          
+          // Send success response to AI
+          safeSendOpenAI({
+            type: "conversation.item.create",
+            item: {
+              type: "function_call_output",
+              call_id: callId,
+              output: JSON.stringify({
+                status: "transferring",
+                message: "Transfer initiated successfully"
+              }),
+            },
+          });
+          
+          // Let AI say goodbye message
+          safeSendOpenAI({ type: "response.create" });
+          
+          // Wait for AI to speak, then transfer
+          setTimeout(() => {
+            handleCallTransfer(callSid, args.reason);
+          }, 3000);
+          
+          return;
+        }
+      }
     });
 
     twilioWs.on("message", (msg) => {
@@ -272,6 +473,11 @@ fastify.register(async (fastify) => {fastify.register(async (fastify) => {
       if (data.event === "start") {
         streamSid = data.start.streamSid;
         callSid = data.start.callSid || null;
+        
+        // Store callSid in state
+        const st = getOrCreateState(streamSid);
+        if (st) st.callSid = callSid;
+        
         fastify.log.info({ streamSid, callSid }, "✅ Incoming stream started");
         return;
       }
@@ -300,7 +506,6 @@ fastify.register(async (fastify) => {fastify.register(async (fastify) => {
   });
 });
 
-
 /** -----------------------------
  * Start server
  * ----------------------------- */
@@ -309,4 +514,5 @@ fastify.listen({ port: LISTEN_PORT, host: "0.0.0.0" }, (err) => {
     fastify.log.error(err);
     process.exit(1);
   }
+  console.log(`🚀 Server listening on port ${LISTEN_PORT}`);
 });
