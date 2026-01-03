@@ -307,33 +307,6 @@ fastify.register(async (fastify) => {
           turn_detection: { type: "server_vad" },
           input_audio_transcription: { model: TRANSCRIPTION_MODEL },
           prompt: { id: OPENAI_PROMPT_ID },
-          tools: [
-            {
-              type: "function",
-              name: "kb_search",
-              description: "Search the CallsAnswered.ai knowledge base and return relevant passages.",
-              parameters: {
-                type: "object",
-                properties: { query: { type: "string" } },
-                required: ["query"],
-              },
-            },
-            {
-              type: "function",
-              name: "transfer_to_human",
-              description: "Transfer the call to a human representative when the caller requests to speak with someone or needs human assistance.",
-              parameters: {
-                type: "object",
-                properties: {
-                  reason: {
-                    type: "string",
-                    description: "Brief reason why the caller wants to be transferred"
-                  }
-                },
-                required: ["reason"],
-              },
-            },
-          ],
           tool_choice: "auto",
         },
       });
