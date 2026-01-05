@@ -299,6 +299,7 @@ fastify.register(async (fastify) => {
       safeSendOpenAI({
         type: "session.update",
         session: {
+          type: "realtime",
           model: REALTIME_MODEL,
           modalities: ["audio"],
           voice: DEFAULT_VOICE,
