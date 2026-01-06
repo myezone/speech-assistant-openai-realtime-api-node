@@ -29,6 +29,7 @@ const {
   PUBLIC_HOST,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
+  LOG_LEVEL,
 } = process.env;
 
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
@@ -40,7 +41,7 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const fastify = Fastify({
   logger: {
-    level: process.env.LOG_LEVEL || "info",
+    level: LOG_LEVEL || "info",
   },
 });
 
@@ -55,61 +56,84 @@ const TRANSFER_NUMBER = "+14026171324";
 
 /** --------- Helper Functions --------- */
 
+function normalizeHost(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  // Remove protocol if present
+  const noProto = raw.replace(/^https?:\/\//i, "");
+  // Remove trailing path/slashes
+  const hostOnly = noProto.split("/")[0].trim();
+  return hostOnly || null;
+}
+
 /**
  * Handle call transfer by updating the active call with new TwiML
+ * IMPORTANT: Keep this independent of the OpenAI conversation flow.
  */
-async function handleCallTransfer(callSid, reason) {
+async function handleCallTransfer({ callSid, reason, hostForCallbacks }) {
   if (!callSid) {
-    console.error("❌ Cannot transfer: callSid is null");
+    fastify.log.error("❌ Cannot transfer: callSid is null");
+    return;
+  }
+
+  const callbackHost = normalizeHost(hostForCallbacks) || normalizeHost(PUBLIC_HOST);
+  if (!callbackHost) {
+    fastify.log.error(
+      { callSid },
+      "❌ Cannot transfer: PUBLIC_HOST (or host fallback) is missing/invalid"
+    );
     return;
   }
 
   try {
-    console.log(`📞 Transferring call ${callSid}. Reason: ${reason}`);
+    fastify.log.info({ callSid, reason }, "📞 Transferring call");
 
+    // Update the in-progress call to new TwiML that dials the human number.
+    // Using voice="alice" is the safest default (no Polly dependency).
     await twilioClient.calls(callSid).update({
       twiml: `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">One moment please, I'm connecting you now.</Say>
-  <Dial timeout="30" action="https://${PUBLIC_HOST}/call-transfer-status">
+  <Say voice="alice">Of course, let me connect you with someone who can help right away.</Say>
+  <Dial timeout="30" action="https://${callbackHost}/call-transfer-status" method="POST">
     <Number>${TRANSFER_NUMBER}</Number>
   </Dial>
-  <Say voice="Polly.Joanna">
-    I'm sorry, no one is available to take your call right now. 
-    Please leave a message after the tone.
-  </Say>
-</Response>`
+  <Say voice="alice">I’m sorry, no one is available to take your call right now.</Say>
+</Response>`,
     });
 
-    console.log(`✅ Transfer initiated for call ${callSid} to ${TRANSFER_NUMBER}`);
+    fastify.log.info(
+      { callSid, to: TRANSFER_NUMBER },
+      "✅ Transfer initiated"
+    );
   } catch (error) {
-    console.error(`❌ Transfer failed for call ${callSid}:`, error.message);
+    fastify.log.error(
+      { callSid, err: error?.message || String(error) },
+      "❌ Transfer failed"
+    );
   }
 }
 
 /**
  * Handle knowledge base search
+ * IMPORTANT: Do NOT return placeholder “answers” that could be mistaken as KB truth.
+ * Return empty results until real KB is wired.
  */
 async function handleKbSearch(query) {
   try {
-    fastify.log.info({ query }, "🔍 KB Search requested");
-    
-    // TODO: Replace with your actual KB search logic
-    // For now, returning a placeholder response
+    const q = String(query || "").trim();
+    fastify.log.info({ query: q }, "🔍 KB Search requested");
+
+    // TODO: Replace with your actual KB search logic.
+    // For now, return empty results to avoid hallucinations.
     return {
       success: true,
-      results: [
-        {
-          content: "This is a placeholder KB response. Connect your actual knowledge base here.",
-          relevance: 0.9
-        }
-      ]
+      results: [],
     };
   } catch (error) {
     fastify.log.error({ error: error.message }, "❌ KB Search error");
     return {
       success: false,
-      error: error.message
+      error: error.message,
     };
   }
 }
@@ -127,7 +151,7 @@ function finalizeCallIfPossible(streamSid, callSid) {
   }
 }
 
-/** --------- Transcript aggregation (per callSid) --------- */
+/** --------- Transcript aggregation (per streamSid / callSid) --------- */
 const callStateByStreamSid = new Map();
 
 function getOrCreateState(streamSid) {
@@ -196,7 +220,15 @@ fastify.all("/incoming-call", async (request, reply) => {
     } catch {}
   }
 
-  const host = PUBLIC_HOST || request.headers["x-forwarded-host"] || request.headers.host;
+  const host =
+    normalizeHost(PUBLIC_HOST) ||
+    normalizeHost(request.headers["x-forwarded-host"]) ||
+    normalizeHost(request.headers.host);
+
+  if (!host) {
+    reply.code(500).send("Missing PUBLIC_HOST or request host");
+    return;
+  }
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -208,7 +240,7 @@ fastify.all("/incoming-call", async (request, reply) => {
   reply.code(200).type("text/xml").send(twiml);
 });
 
-/** Twilio status callback */
+/** Twilio status callback (optional; requires Twilio to be configured to call it) */
 fastify.post("/twilio/call-status", async (req, reply) => {
   try {
     const callId = req.body?.CallSid;
@@ -240,9 +272,12 @@ fastify.post("/call-transfer-status", async (req, reply) => {
     );
 
     if (dialCallStatus === "completed") {
-      fastify.log.info({ callSid, duration: dialCallDuration }, "✅ Transfer successful - call answered");
+      fastify.log.info(
+        { callSid, duration: dialCallDuration },
+        "✅ Transfer successful - call answered"
+      );
     } else if (dialCallStatus === "no-answer" || dialCallStatus === "busy") {
-      fastify.log.info({ callSid }, "⚠️ Transfer failed - going to voicemail");
+      fastify.log.info({ callSid }, "⚠️ Transfer not answered/busy");
     } else if (dialCallStatus === "failed") {
       fastify.log.error({ callSid }, "❌ Transfer failed");
     }
@@ -256,8 +291,8 @@ fastify.post("/call-transfer-status", async (req, reply) => {
 /** -----------------------------
  * WebSocket: Twilio ↔ OpenAI Realtime
  * ----------------------------- */
-fastify.register(async (fastify) => {
-  fastify.get("/media-stream", { websocket: true }, (connection, req) => {
+fastify.register(async (fastifyInstance) => {
+  fastifyInstance.get("/media-stream", { websocket: true }, (connection, req) => {
     const twilioWs = connection.socket;
 
     fastify.log.info(
@@ -270,16 +305,26 @@ fastify.register(async (fastify) => {
       "✅ Twilio WS route entered"
     );
 
+    const hostForCallbacks =
+      normalizeHost(PUBLIC_HOST) ||
+      normalizeHost(req.headers["x-forwarded-host"]) ||
+      normalizeHost(req.headers.host);
+
     let streamSid = null;
     let callSid = null;
 
-    const userTranscriptBufferByItem = new Map();
     const assistantTranscriptBufferByResp = new Map();
     const handledToolCalls = new Set();
 
-    const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    });
+    let greetingSent = false;
+    let transferring = false;
+
+    const openAiWs = new WebSocket(
+      `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
+      {
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      }
+    );
 
     openAiWs.on("error", (err) => {
       fastify.log.error({ err: String(err) }, "❌ OpenAI WS error");
@@ -301,18 +346,51 @@ fastify.register(async (fastify) => {
         session: {
           type: "realtime",
           model: REALTIME_MODEL,
-          modalities: ["audio"],
-          voice: DEFAULT_VOICE,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          turn_detection: { type: "server_vad" },
-          input_audio_transcription: { model: TRANSCRIPTION_MODEL },
-          prompt: { id: OPENAI_PROMPT_ID },
+
+          // Lock output to audio for phone experience.
+          output_modalities: ["audio"],
+
+          audio: {
+            input: {
+              // Twilio Media Streams inbound is 8k mu-law (pcmu)
+              format: { type: "audio/pcmu" },
+
+              // Enable transcriptions so you can receive:
+              // conversation.item.input_audio_transcription.completed
+              transcription: {
+                model: TRANSCRIPTION_MODEL, // e.g. "whisper-1"
+                language: "en",
+              },
+
+              // Voice activity detection (auto commit turns + create model responses)
+              turn_detection: {
+                type: "server_vad",
+                // The below values are safe defaults; tweak as needed.
+                threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500,
+                interrupt_response: true,
+                create_response: true,
+                idle_timeout_ms: 15000,
+              },
+            },
+
+            output: {
+              // Twilio expects base64 mu-law 8k; audio/pcmu matches
+              format: { type: "audio/pcmu" },
+              voice: DEFAULT_VOICE,
+            },
+          },
+
+          // Use stored prompt + pin a version
+          prompt: {
+            id: OPENAI_PROMPT_ID,
+            version: "13",
+          },
+
           tool_choice: "auto",
         },
       });
-
-      safeSendOpenAI({ type: "response.create" });
     };
 
     openAiWs.on("open", () => {
@@ -329,7 +407,24 @@ fastify.register(async (fastify) => {
         return;
       }
 
-      // Handle audio output
+      // Always log errors
+      if (evt.type === "error") {
+        fastify.log.error({ evt }, "❌ OpenAI error event");
+        return;
+      }
+
+      // Only create the first response once
+      if (evt.type === "session.updated" && !greetingSent) {
+        greetingSent = true;
+        fastify.log.info({ prompt: evt.session?.prompt }, "✅ session.updated received");
+        safeSendOpenAI({ type: "response.create" });
+        return;
+      }
+
+      // Stop processing if we’re transferring the call.
+      if (transferring) return;
+
+      // Handle audio output -> Twilio
       if (evt.type === "response.output_audio.delta") {
         if (streamSid && evt.delta && twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(
@@ -345,9 +440,7 @@ fastify.register(async (fastify) => {
 
       // Handle user transcription completion
       if (evt.type === "conversation.item.input_audio_transcription.completed") {
-        const itemId = evt.item_id;
         const transcript = evt.transcript || "";
-        userTranscriptBufferByItem.set(itemId, transcript);
         addTurn(streamSid, "user", transcript);
         return;
       }
@@ -376,21 +469,21 @@ fastify.register(async (fastify) => {
       if (evt.type === "response.function_call_arguments.done") {
         const callId = evt.call_id;
         const functionName = evt.name;
-        
+
         // Prevent duplicate handling
         if (handledToolCalls.has(callId)) return;
         handledToolCalls.add(callId);
 
         let args;
         try {
-          args = JSON.parse(evt.arguments);
+          args = JSON.parse(evt.arguments || "{}");
         } catch {
           args = {};
         }
 
         fastify.log.info({ functionName, args, callId }, "🔧 Function call received");
 
-        // Handle kb_search
+        // kb_search tool
         if (functionName === "kb_search") {
           const result = await handleKbSearch(args.query);
           safeSendOpenAI({
@@ -401,15 +494,18 @@ fastify.register(async (fastify) => {
               output: JSON.stringify(result),
             },
           });
+
+          // Prompt model to continue with KB-only response
           safeSendOpenAI({ type: "response.create" });
           return;
         }
 
-        // Handle transfer_to_human
+        // transfer_to_human tool (IMMEDIATE transfer)
         if (functionName === "transfer_to_human") {
+          transferring = true;
           fastify.log.info({ callSid, reason: args.reason }, "📞 Initiating call transfer");
-          
-          // Send success response to AI
+
+          // Acknowledge tool execution (no further model speech)
           safeSendOpenAI({
             type: "conversation.item.create",
             item: {
@@ -417,19 +513,29 @@ fastify.register(async (fastify) => {
               call_id: callId,
               output: JSON.stringify({
                 status: "transferring",
-                message: "Transfer initiated successfully"
+                to: TRANSFER_NUMBER,
               }),
             },
           });
-          
-          // Let AI say goodbye message
-          safeSendOpenAI({ type: "response.create" });
-          
-          // Wait for AI to speak, then transfer
-          setTimeout(() => {
-            handleCallTransfer(callSid, args.reason);
-          }, 3000);
-          
+
+          // Immediately update Twilio call to dial out
+          await handleCallTransfer({
+            callSid,
+            reason: args.reason || "requested_human",
+            hostForCallbacks,
+          });
+
+          // Close OpenAI socket to prevent further output during transfer
+          try {
+            if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+          } catch {}
+
+          // Twilio will usually terminate the stream once call is updated,
+          // but we can close this WS too as a safety measure.
+          try {
+            if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+          } catch {}
+
           return;
         }
       }
@@ -447,17 +553,18 @@ fastify.register(async (fastify) => {
       if (data.event === "start") {
         streamSid = data.start.streamSid;
         callSid = data.start.callSid || null;
-        
-        // Store callSid in state
+
+        // Store callSid in state for logging
         const st = getOrCreateState(streamSid);
         if (st) st.callSid = callSid;
-        
+
         fastify.log.info({ streamSid, callSid }, "✅ Incoming stream started");
         return;
       }
 
       if (data.event === "media") {
-        if (openAiWs.readyState === WebSocket.OPEN) {
+        if (!transferring && openAiWs.readyState === WebSocket.OPEN) {
+          // Twilio sends base64 mu-law payload; forward directly to input buffer
           safeSendOpenAI({ type: "input_audio_buffer.append", audio: data.media.payload });
         }
         return;
