@@ -31,6 +31,7 @@ dotenv.config();
 
 const {
   OPENAI_API_KEY,
+  OPENAI_PROMPT_ID,
   VECTOR_STORE_ID,
   PORT,
   VOICE,
